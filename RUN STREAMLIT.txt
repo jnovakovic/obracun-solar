@@ -1,0 +1,5 @@
+(base) C:\Users\JoškoNovaković>   activate new
+
+(new) C:\Users\JoškoNovaković>    cd C:\OneDrive\OneDrive - Fakultet elektrotehnike, strojarstva i brodogradnje\visual studio\Obracun\Github2
+
+(new) C:\OneDrive\OneDrive - Fakultet elektrotehnike, strojarstva i brodogradnje\visual studio\Obracun>   streamlit run app.py
