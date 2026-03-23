@@ -1,0 +1,72 @@
+/* Mobile-first responsive design */
+.main .block-container {
+    padding-top: 1rem;
+    padding-bottom: 1rem;
+}
+
+/* Make inputs and controls more touch-friendly */
+input, select, button, .stSlider, .stSelectbox {
+    min-height: 40px !important;
+}
+
+/* Improve sidebar usability on mobile */
+@media (max-width: 768px) {
+    .sidebar .sidebar-content {
+        padding-top: 1rem;
+    }
+    
+    /* Adjust font sizes for mobile */
+    h1 {
+        font-size: 1.8rem !important;
+    }
+    h2 {
+        font-size: 1.5rem !important;
+    }
+    h3 {
+        font-size: 1.2rem !important;
+    }
+    p, li, .stMarkdown {
+        font-size: 0.9rem !important;
+    }
+    
+    /* Make plots responsive */
+    .stPlotlyChart {
+        height: auto !important;
+        width: 100% !important;
+    }
+    
+    /* Adjust map size for mobile */
+    .folium-map {
+        height: 300px !important;
+    }
+}
+
+/* Make tabs more visible and touch-friendly */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 2px;
+}
+.stTabs [data-baseweb="tab"] {
+    height: 50px;
+    white-space: pre-wrap;
+    background-color: #f0f2f6;
+    border-radius: 4px;
+    padding: 10px;
+    margin-right: 2px;
+}
+.stTabs [aria-selected="true"] {
+    background-color: #e6f0ff;
+    border-bottom: 2px solid #4e89e8;
+}
+
+/* Improve button visibility */
+.stButton>button {
+    width: 100%;
+    border-radius: 5px;
+    height: 3em;
+    font-weight: 500;
+}
+
+/* Adjust file uploader for mobile */
+.stFileUploader>div>div {
+    padding: 15px !important;
+}
