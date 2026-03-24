@@ -5,3 +5,4 @@ pvlib
 folium
 requests
 streamlit_folium 
+matplotlib
