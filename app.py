@@ -17,6 +17,7 @@ import os
 import pdb
 from pvlib.iotools import get_pvgis_tmy
 import requests
+import time
 
 
 # Set page configuration
@@ -973,16 +974,35 @@ with tabs[4]:
     
     
     if st.button("Izvrši financijsku analizu"):
+
+        start_time = time.time()
+
+        # Placeholders for live timer and final message     
+        timer_placeholder = st.empty()
+        spinner_placeholder = st.spinner("Vršim financijsku analizu...")      
+
+        st.write("Vrijeme izvođenja analize može varirati ovisno o performansama računala (oko 60 sekundi)")
         if 'production_data' not in st.session_state or 'prices_df' not in st.session_state:     
             st.warning("Molim izračunajte proizvodnju SE u kartici Proizvodnja i Godišnji račun...")
         else:
-            with st.spinner("Vršim financijsku analizu ..."):
-                                    # Get production data from session state
+            with spinner_placeholder:          
+                    # Get production data from session state
                     production_data = st.session_state['production_data']
                     no_pv_df=production_data.copy()
                     no_pv_df['ac_power_kw']=0
                     prices_df=st.session_state['prices_df']                    
                     consumption_df=st.session_state['consumption_data']['consumption_df']
+
+                    def calculate_loan_payment(principal, annual_rate, years):
+                        """Calculate annual loan payment using annuity formula"""
+                        if annual_rate == 0 or years == 0:
+                            return principal / years if years > 0 else principal
+                        
+                        r = annual_rate / 100  # convert % to decimal
+                        n = years
+                        # Annual payment formula
+                        payment = principal * (r * (1 + r)**n) / ((1 + r)**n - 1)
+                        return payment
                     
                     # Calculate system cost
                     system_size_watts = system_capacity_kw * 1000
@@ -991,23 +1011,33 @@ with tabs[4]:
                     net_system_cost = total_system_cost - incentives
                     annual_maintenance_cost = total_system_cost * (maintenance_cost_percent / 100)
 
+                    # === Loan calculations ===
+                    loan_amount = net_system_cost * (loan_percent / 100)          # e.g. 70% financed
+                    equity_amount = net_system_cost - loan_amount
+
+                    annual_loan_payment = calculate_loan_payment(
+                    principal=loan_amount,
+                    annual_rate=loan_interest_rate,
+                    years=loan_term_years
+                    )
+
                     years = list(range(1, system_lifetime_years+1))
                     yearly_production = []
                     yearly_maintenance = []
 
-                    yearly_savings_month = [-net_system_cost]
-                    yearly_savings_15min = [-net_system_cost]
+                    yearly_savings_month = [-equity_amount]
+                    yearly_savings_15min = [-equity_amount]
 
-                    discounted_yearly_savings_month= [-net_system_cost]
-                    discounted_yearly_savings_15min= [-net_system_cost]                    
-                                       
-                    yearly_cumulative_savings_month = [-net_system_cost]
-                    yearly_cumulative_savings_15min = [-net_system_cost]             
+                    discounted_yearly_savings_month= [-equity_amount]
+                    discounted_yearly_savings_15min= [-equity_amount]                    
+                                        
+                    yearly_cumulative_savings_month = [-equity_amount]
+                    yearly_cumulative_savings_15min = [-equity_amount]             
             
-                    cumulative_savings_month = -net_system_cost  # Start with negative investment
-                    cumulative_savings_15min = -net_system_cost  # Start with negative investment
+                    cumulative_savings_month = -equity_amount  # Start with negative investment
+                    cumulative_savings_15min = -equity_amount  # Start with negative investment
 
-                    year_baseline_cost_list = []
+                    year_baseline_cost_list = []                
                     
                     for year in years:
                         prices_csv=f'{tariff}.csv'
@@ -1047,13 +1077,18 @@ with tabs[4]:
                             year_savings_month -= inverter_replacement_cost
                             year_savings_15min -= inverter_replacement_cost
 
+                        # Subtract annual loan payment (only during loan term)
+                        if year <= loan_term_years:
+                            year_savings_month -= annual_loan_payment
+                            year_savings_15min -= annual_loan_payment                        
+
                         discounted_year_savings_month = year_savings_month / ((1 + discount_rate/100) ** (year-1))
                         discounted_year_savings_15min = year_savings_15min / ((1 + discount_rate/100) ** (year-1))
- 
+
                         # Update cumulative savings
                         cumulative_savings_month += discounted_year_savings_month
                         cumulative_savings_15min += discounted_year_savings_15min
-                                                                                                                                                              
+                                                                                                                                                                
                         year_production=year_production_data['ac_power_kw'].sum()
                         
                         # Store values
@@ -1068,16 +1103,16 @@ with tabs[4]:
 
                         yearly_cumulative_savings_month.append(cumulative_savings_month)
                         yearly_cumulative_savings_15min.append(cumulative_savings_15min)
-                                       
-                    for item in yearly_cumulative_savings_month:
+                                        
+                    for item in yearly_cumulative_savings_month[1:]:
                         if item >= 0:
-                            discounted_payback_years_month = years[yearly_cumulative_savings_month.index(item)]-1
+                            discounted_payback_years_month = years[yearly_cumulative_savings_month.index(item)-1]
                             break
                         else:
                             discounted_payback_years_month = system_lifetime_years + 1  # If never pays back within lifetime
-                    for item in yearly_cumulative_savings_15min:
+                    for item in yearly_cumulative_savings_15min[1:]:
                         if item >= 0:
-                            discounted_payback_years_15min = years[yearly_cumulative_savings_15min.index(item)]-1
+                            discounted_payback_years_15min = years[yearly_cumulative_savings_15min.index(item)-1]
                             break
                         else:
                             discounted_payback_years_15min = system_lifetime_years + 1  # If never pays back within lifetime      
@@ -1094,7 +1129,7 @@ with tabs[4]:
                         irr = newton(npv_equation, 0.1)  # Use 10% as initial guess
                     except:
                         irr = 0  # Default if calculation fails"""
-    
+
                                         # Display financial metrics
                     st.subheader("Pregled financijskih pokazatelja")
                     
@@ -1103,6 +1138,8 @@ with tabs[4]:
                         metrics_cols = st.columns(1)
                         metrics_cols[0].metric("Ukupni troškovi SE", f"€{total_system_cost:,.2f}")
                         metrics_cols[0].metric("Neto ukupni troškovi sa subvencijom", f"€{net_system_cost:,.2f}")
+                        metrics_cols[0].metric("Početna investicija", f"€{equity_amount:,.2f}")
+
 
                         metrics_cols[0].write("Mj.netiranje")
                         metrics_cols[0].metric("Godišnja ušteda (za 1. godinu)", f"€{yearly_savings_month[1]:,.2f}")
@@ -1120,6 +1157,7 @@ with tabs[4]:
                         col1, col2, col3 = st.columns(3)
                         col1.metric("Ukupni troškovi SE", f"€{total_system_cost:,.2f}")
                         col1.metric("Neto ukupni troškovi sa subvencijom", f"€{net_system_cost:,.2f}")
+                        col1.metric("Početna investicija", f"€{equity_amount:,.2f}")
                         #col1.metric("Lista kumulativna", f"{yearly_cumulative_savings_month}")
                         #col1.metric("Lista ušteda", f"{yearly_savings_month}")
 
@@ -1194,15 +1232,132 @@ with tabs[4]:
                     )
                     
                     st.plotly_chart(fig, use_container_width=True)
+
+                    elapsed = time.time() - start_time
+                    timer_placeholder.info(f"⏱️ Proteklo vrijeme: **{elapsed:.1f} sekundi**")
+                            
+                            
+                                                   
  
 
 with tabs[5]:
     st.header("Rezultati")
-    st.write("dsfvgsdfhfdgh")
 
     # Financial inputs section
-    st.subheader("Financijski parametri")
+    #st.subheader("Financijski parametri")
     col1, col2 = st.columns(1) if st.session_state.get('_is_mobile', False) else st.columns(2)
+
+    if st.session_state.get('consumption_data') is not None:
+        # Group by month
+        monthly_energy = energy_balance.resample('ME').sum()
+        monthly_energy.index = monthly_energy.index.strftime('%b')             
+        
+        st.subheader("Mjesečni pregled bilance energije kod mjesečnog netiranja")
+        st.write("Samo mjesečni viškovi proizvedene energije se obračunavaju po cijeni energije isporučene u mrežu, koja je značajno niža od cijene preuzete energije.")
+        st.write("U slučaju da je više energije potrošeno nego proizvedeno unutar mjeseca, čitava proizvedena energija je samopotrošena, tj. nema isporučene energije u mrežu.")
+        # Create stacked bar chart
+        fig = go.Figure()
+        
+        fig.add_trace(go.Bar(
+            x=monthly_energy.index,
+            y=monthly_energy['production_kw'],
+            name='Proizvodnja',
+            marker_color='#2ca02c',
+            opacity=1.0
+        ))
+
+        fig.add_trace(go.Bar(
+            x=monthly_energy.index,
+            y=-np.maximum(0, monthly_energy['net_kw']),
+            name='Neto višak ',
+            marker=dict(
+                color='#1f77b4',  
+                pattern_shape='/' ,                 # diagonal hatch (most visible)
+                # Other good options: 'x', '\\', '|', '-', '+', '.'
+                pattern_fillmode='overlay',         # important: draws pattern on top of color
+                pattern_fgcolor='#2ca02c',  
+                pattern_fgopacity=1,
+                pattern_size=24,                     # density of the hatching
+                line=dict(color='rgba(214, 39, 40, 0.6)', width=0.5)  # optional thin border
+            )
+        ))
+
+        fig.add_trace(go.Bar(
+            x=monthly_energy.index,
+            y=-np.minimum(0, monthly_energy['net_kw']),
+            name='Neto manjak ',
+            marker_color='#d62728'
+            )) 
+        
+        # Add consumption line
+        fig.add_trace(go.Scatter(
+            x=monthly_energy.index,
+            y=monthly_energy['consumption_kw'],
+            name='Potrošnja',
+            marker_color='#ff7f0e',
+            mode='lines+markers'
+        ))
+        
+        fig.update_layout(
+            title='Mjesečna bilanca energije',
+            xaxis=dict(title='Mjesec'),
+            yaxis=dict(title='Energija (kWh)'),
+            barmode='stack',
+            legend=dict(x=0.01, y=0.99),
+            hovermode='x unified'
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+
+
+        # Create monthly breakdown chart
+        st.subheader("Mjesečni pregled bilance energije kod 15minutnog netiranja")
+        st.write("Svi viškovi proizvedene energije unutar 15-minutnog perioda se obračunavaju po cijeni energije isporučene u mrežu, koja je značajno niža od cijene preuzete energije.")
+
+
+        # Create stacked bar chart
+        fig = go.Figure()
+        
+        fig.add_trace(go.Bar(
+            x=monthly_energy.index,
+            y=monthly_energy['self_consumed_kw'],
+            name='Samopotrošnja',
+            marker_color='#2ca02c'
+        ))
+
+        fig.add_trace(go.Bar(
+            x=monthly_energy.index,
+            y=monthly_energy['imported_kw'],
+            name='Preuzeto iz mreže',
+            marker_color='#d62728'
+        ))
+        fig.add_trace(go.Bar(
+            x=monthly_energy.index,
+            y=monthly_energy['exported_kw'],
+            name='Isporučeno u mrežu',
+            marker_color='#1f77b4'
+        ))
+        
+        # Add consumption line
+        fig.add_trace(go.Scatter(
+            x=monthly_energy.index,
+            y=monthly_energy['consumption_kw'],
+            name='Potrošnja',
+            marker_color='#ff7f0e',
+            mode='lines+markers'
+        ))
+        
+        fig.update_layout(
+            title='Mjesečna bilanca energije',
+            xaxis=dict(title='Mjesec'),
+            yaxis=dict(title='Energija (kWh)'),
+            barmode='stack',
+            legend=dict(x=0.01, y=0.99),
+            hovermode='x unified'
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
                    
         
                 
