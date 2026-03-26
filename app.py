@@ -1,21 +1,14 @@
 import streamlit as st
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from energy_billing import izvrši_obracun, plot_bill_style, display_bill_table, plot_bill_style_plotly,plot_bill_style2, plot_bill_style3   
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
-from pvlib.location import Location
-from pvlib.pvsystem import PVSystem
-from pvlib.modelchain import ModelChain
-from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
 import folium
 from streamlit_folium import st_folium
-from pvlib.iotools import get_pvgis_tmy
 import requests
 import time
-
 
 # Set page configuration
 st.set_page_config(
