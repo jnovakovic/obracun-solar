@@ -4,17 +4,15 @@ import matplotlib.pyplot as plt
 import streamlit as st
 import numpy as np
 
-
 def energy_calculation (production_data, consumption_df,sub_kWh):
 
-    load_pv =pd.DataFrame()
-    #load_pv=production_data.index
+    load_pv =pd.DataFrame()    
     load_pv['Load']=consumption_df['consumption_kw']
     load_pv['PV_kWh']= production_data['ac_power_kw']
     load_pv['net_kWh']=load_pv['Load'] - load_pv['PV_kWh']
     load_pv['from_Grid_kWh']=load_pv['net_kWh'].apply(lambda x: x if x>0 else 0)
     load_pv['to_Grid_kWh']=load_pv['net_kWh'].apply(lambda x: x if x<0 else 0)
-    #load_pv.to_csv('LPV.csv')
+   
     dates=load_pv.index
     months=dates.month.unique() 
     obracun=pd.DataFrame(index=months, columns=['Load_total_kWh','PV_total_kWh','net_total_kWh','Load_HT_kWh','PV_HT_kWh','net_HT_kWh','Load_LT_kWh','PV_LT_kWh','net_LT_kWh', ])     
@@ -144,7 +142,7 @@ def energy_calculation (production_data, consumption_df,sub_kWh):
     return obracun 
 
 def create_invoice(net_interval, obracun,prices_df,sub_kWh, kSO): 
-    #prices=pd.read_csv(prices_csv,index_col=None)  
+     
     prices_dict=prices_df.to_dict('records')[0]  
 
     net_interval=net_interval 
@@ -196,13 +194,13 @@ def create_invoice(net_interval, obracun,prices_df,sub_kWh, kSO):
                 coeff_from_to=-(round(obracun.loc[i, 'from_Grid_HT_kWh'])+round(obracun.loc[i, 'from_Grid_LT_kWh']))/(round(obracun.loc[i, 'to_Grid_HT_kWh'])+round(obracun.loc[i, 'to_Grid_LT_kWh']))
            
             avg_buy_price=(round(obracun.loc[i, 'from_Grid_HT_kWh'])*prices_dict['Energy_HT']+round(obracun.loc[i, 'from_Grid_LT_kWh'])*prices_dict['Energy_LT'])\
-                            /(round(obracun.loc[i, 'from_Grid_HT_kWh'])+round(obracun.loc[i, 'from_Grid_LT_kWh']))
-            #print(f"{key} - Coeff from/to: {coeff_from_to:.2f}, Avg buy price: {avg_buy_price:.4f} EUR/kWh")                                                                 
+                            /max(1, (round(obracun.loc[i, 'from_Grid_HT_kWh'])+round(obracun.loc[i, 'from_Grid_LT_kWh'])))
+                                                                         
             coef_sell=0.9*min(1,coeff_from_to)*kSO
-            #print(f"{key} - Adjusted sell coefficient:{coef_sell}") 
+            
             sell_price_HT=coef_sell*avg_buy_price
             sell_price_LT=coef_sell*avg_buy_price
-            #print(f"{key} - Adjusted sell price HT:{sell_price_HT:.3f} EUR/kWh, LT:{sell_price_LT:.3f} EUR/kWh")   
+               
          
         racuni[key].loc[16, 'Opis'] ='RVT Distribucija'
         if net_interval=='month':  
@@ -378,8 +376,7 @@ def year_total(obracun,racuni):
                 godisnja_bilanca.loc[month,'Bill']=racuni[key].loc[9, 'Iznos EUR']
         for column in godisnja_bilanca.columns:        
                 godisnja_bilanca.loc['Year',column]=round(godisnja_bilanca[column].sum(),2)
-        #godisnja_bilanca.loc['Year','Sub_kWh_left']=''
-
+        
         all_df = pd.concat([racuni[month] for month in lista_mjeseci])
         columns_to_sum = ['Iznos EUR', 'Količina','Potrošak']
         existing_cols = [col for col in columns_to_sum if col in all_df.columns]
@@ -463,7 +460,6 @@ def plot_bill_style_plotly(df):
     )
     
     return fig
-
 
 
 def display_bill_table(fig, df_bill):
@@ -624,23 +620,6 @@ def plot_bill_style3(df):
                 table[i, j].get_text().set_text("")
         elif i in ([17,18]):
             for j in range(2):
-                table[i, j].set_text_props(weight='bold')
-            
-    
-        
-    fig.subplots_adjust(top=1, bottom=0, left=0, right=1, hspace=0, wspace=0)
-    
-    #fig.tight_layout()
+                table[i, j].set_text_props(weight='bold')          
+        fig.subplots_adjust(top=1, bottom=0, left=0, right=1, hspace=0, wspace=0)      
     return fig
-
-
-@st.cache_data(
-    ttl="30min",
-    show_spinner=False   # or custom message
-)
-def cached_izvrsi_obracun(production_data, consumption_df, prices_df, sub_kWh=3000, net_interval='month', kSO=1):
-    """Cached wrapper around the full billing + invoice + yearly summary"""
-    obracun_energije = energy_calculation(production_data, consumption_df, sub_kWh)
-    racuni = create_invoice(net_interval, obracun_energije, prices_df, sub_kWh, kSO)
-    bilanca, godisnji_racun = year_total(obracun_energije, racuni)
-    return obracun_energije, racuni, bilanca, godisnji_racun
