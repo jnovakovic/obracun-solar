@@ -5,16 +5,13 @@ import pandas as pd
 from energy_billing import izvrši_obracun, plot_bill_style, display_bill_table, plot_bill_style_plotly,plot_bill_style2, plot_bill_style3   
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import pvlib
+from datetime import datetime
 from pvlib.location import Location
 from pvlib.pvsystem import PVSystem
 from pvlib.modelchain import ModelChain
 from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
 import folium
 from streamlit_folium import st_folium
-import os
-import pdb
 from pvlib.iotools import get_pvgis_tmy
 import requests
 import time
@@ -99,16 +96,6 @@ with tabs[0]:
         altitude = st.number_input("Altitude (m)", min_value=0, max_value=5000, value=10, step=10)
         timezone = st.selectbox("Timezone", options=["Europe/Berlin","Europe/London","US/Eastern", "US/Central", "US/Mountain", "US/Pacific",   "Asia/Tokyo", "Australia/Sydney"], index=0)
     
-
-        # Create a map centered at the current coordinates from session state
-        #m = folium.Map(location=[st.session_state.latitude, st.session_state.longitude], zoom_start=10,tiles='https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png',  attr='© CartoDB')
-        #folium.Marker(
-        #[st.session_state.latitude, st.session_state.longitude],
-        #popup="Solar Installation Site",
-        #tooltip="Solar Installation Site",
-        #icon=folium.Icon(color="orange", icon="sun", prefix="fa")
-        #).add_to(m) 
-
         m = folium.Map(location=[latitude, longitude], zoom_start=10)
         folium.Marker(
             [latitude, longitude],
@@ -135,7 +122,6 @@ with tabs[0]:
     
     with col1:
         system_capacity_kw = st.number_input("Instalirana snaga solarne elektrane  (kW)", min_value=0.5, max_value=100.0, value=4.5, step=0.1)
-        #module_type = st.selectbox("Tip modula", options=["monoSi", "multiSi", "cSi", "cis", "CIGS", "CdTe", "amorphous"], index=0)
         module_type = st.selectbox("Tip modula", options=["crystSi", "CIS", "CdTe"], index=0)
         total_system_losses_percent = st.slider("Gubici u sustavu (%)", min_value=0, max_value=30, value=14, step=1)
         
@@ -143,112 +129,12 @@ with tabs[0]:
         tilt = st.number_input("Kut nagiba modula (stupnjevi)", min_value=0, max_value=90, value=20, step=1)
         azimuth = st.number_input("Azimut (stupnjevi, 0=Jug)", min_value=-180, max_value=180, value=0, step=1)
         tracking_type = st.selectbox("Tip praćenja sunca ", options=["Fiksni položaj modula","Horizontalna os S-J", "Dvoosni", "Vertikalna os","Horizontalno I-Z"], index=0)
-        tracking_type_dict = {"Fiksni položaj modula": 0, "Horizontalna os S-J": 1, "Dvoosni": 2, "Vertikalna os": 3, "Horizontalno I-Z": 4}
-        
-    #Advanced system parameters (collapsible)
-    #with st.expander("Napredni parametri sustava"):
-        #col1, col2 = st.columns(1) if st.session_state.get('_is_mobile', False) else st.columns(2)
-        #with col1:
-            #dc_ac_ratio = st.number_input("DC/AC omjer", min_value=1.0, max_value=2.0, value=1.2, step=0.05)
-            #inverter_efficiency = st.slider("Efikasnost invertera (%)", min_value=90, max_value=99, value=96, step=1)
-        #with col2:
-            #temperature_coefficient = st.number_input("Temperaturni koeficijent gubitaka modula (%/°C)", min_value=-0.5, max_value=0.0, value=-0.4, step=0.01)
-            #degradation_rate = st.slider("Godišnja stopa degradacije modula (%)", min_value=0.0, max_value=2.0, value=0.8, step=0.1) 
-
-                   
+        tracking_type_dict = {"Fiksni položaj modula": 0, "Horizontalna os S-J": 1, "Dvoosni": 2, "Vertikalna os": 3, "Horizontalno I-Z": 4}                         
              
 with tabs[1]:
     st.header("Proizvodnja energije solarne elektrane")
     st.write("Procijenjena proizvodnja električne energije solarne elektrane prema lokaciji i parametrima sustava.")
     
-    tmy_data, meta = get_pvgis_tmy(latitude, longitude)
-    tmy_data = tmy_data.tz_convert(timezone)
-
-    def calculate_solar_production(latitude, longitude, altitude, timezone, 
-                                  system_capacity_kw, module_type, total_system_losses_percent, 
-                                  tilt, azimuth, tracking, 
-                                  dc_ac_ratio, temperature_coefficient, tmy_data,inverter_efficiency):
-        # Create location object
-        site = Location(latitude, longitude, timezone, altitude, f'Solar Site at {latitude:.4f}, {longitude:.4f}')
-        
-        # Define time period for simulation (1 year with hourly resolution)
-        start = pd.Timestamp(datetime.now().year, 1, 1, 0, 0, 0, tz=timezone)
-        end = pd.Timestamp(datetime.now().year, 12, 31, 23, 0, 0, tz=timezone)
-        time_range = pd.date_range(start=start, end=end, freq='1h', tz=timezone)
-
-        tmy_data.index=time_range       
-   
-        # Set up PV system parameters
-        module_parameters = {
-            'pdc0': system_capacity_kw * 1000,  # Convert kW to W
-            'gamma_pdc': temperature_coefficient / 100,  # Convert from %/C to 1/C
-        }
-        
-        # Critical: Define inverter max AC output based on DC/AC ratio
-        paco = (system_capacity_kw * 1000) / dc_ac_ratio  # Max AC power in Watts
-        
-        # Set up temperature model parameters based on module type
-        temp_model = TEMPERATURE_MODEL_PARAMETERS['sapm']['open_rack_glass_glass']
-        
-        # Create PV system object
-        # Add inverter parameters to fix the error
-        inverter_parameters = {
-        'pdc0': system_capacity_kw * 1000,  # Often same as module pdc0
-        'paco': paco,
-        'eta_inv_nom': inverter_efficiency/100,  # Convert from % to decimal
-        }
-        
-        if tracking == "Fiksni položaj modula":  
-            system = PVSystem(
-                surface_tilt=tilt,
-                surface_azimuth=azimuth,
-                module_parameters=module_parameters,
-                temperature_model_parameters=temp_model,
-                losses_parameters={'dc_ohmic_percent': total_system_losses_percent},
-                inverter_parameters=inverter_parameters
-            )
-        elif tracking == "Jednoosni":
-            system = PVSystem(
-                surface_tilt=tilt,
-                surface_azimuth=azimuth,
-                module_parameters=module_parameters,
-                temperature_model_parameters=temp_model,
-                losses_parameters={'dc_ohmic_percent': total_system_losses_percent},
-                inverter_parameters=inverter_parameters,
-                tracking_parameters={'axis_tilt': 0, 'axis_azimuth': 180, 'max_angle': 90, 'backtrack': True}
-            )
-        else:  # Dual-Axis
-            system = PVSystem(
-                surface_tilt=0,  # Will be adjusted dynamically
-                surface_azimuth=180,  # Will be adjusted dynamically
-                module_parameters=module_parameters,
-                temperature_model_parameters=temp_model,
-                losses_parameters={'dc_ohmic_percent': total_system_losses_percent},
-                inverter_parameters=inverter_parameters
-            )
-        
-        # Create ModelChain object
-        mc = ModelChain(system, site, aoi_model='physical', spectral_model='no_loss',losses_model='no_loss')
-        
-        # Run the simulation with TMY data
-        #weather = site.get_clearsky(time_range)
-        weather = tmy_data[['ghi', 'dni', 'dhi', 'temp_air', 'wind_speed']].copy()      
-        
-        # Run the model
-        mc.run_model(weather)
-
-        #ac_power_w = mc.results.ac * (1 - total_system_losses_percent / 100)   
-        ac_power_w = mc.results.ac     
-        # Convert to DataFrame with datetime index
-        df = pd.DataFrame({
-            'ac_power_w': ac_power_w,
-            'ac_power_kw': ac_power_w / 1000,  # Convert W to kW
-            'ghi': weather['ghi'],
-            'dni': weather['dni'],
-            'dhi': weather['dhi'],
-        }, index=time_range)
-        
-        return df
     def get_hourly_radiation(latitude, longitude, start_year=2019, end_year=2019, peakpower=system_capacity_kw, loss=14, angle=20, aspect=0, pvtechchoice='crystSi', mountingplace='free', trackingtype=0):
         """
         Fetch hourly solar radiation data from PVGIS API.
@@ -284,16 +170,10 @@ with tabs[1]:
             "browser": 0         # 0 = stream response
         }
         
-        response = requests.get(base_url, params=params)
-        
+        response = requests.get(base_url, params=params)        
         if response.status_code != 200:
-            raise Exception(f"API request failed: {response.status_code} - {response.text}")
-        
+            raise Exception(f"API request failed: {response.status_code} - {response.text}")        
         data = response.json()
-
-        #start = pd.Timestamp(datetime.now().year, 1, 1, 0, 0, 0, tz=timezone)
-        #end = pd.Timestamp(datetime.now().year, 12, 31, 23, 0, 0, tz=timezone)
-        #time_range = pd.date_range(start=start, end=end, freq='1h', tz=timezone)
         
         # Extract the hourly data from the JSON response
         hourly_list = data.get("outputs", {}).get("hourly", [])
@@ -309,14 +189,12 @@ with tabs[1]:
             df['time'] = pd.to_datetime(df['time'], format='%Y%m%d:%H%M')
         df.set_index('time', inplace=True)
         return df
-
     
     # Calculate production if user clicks the button
     if st.button("Izračunaj proizvodnju SE"):
         with st.spinner("Računam proizvodnju SE..."):
             try:
-                # Get production data            
-     
+                # Get production data           
                 production_data = get_hourly_radiation(latitude, longitude, start_year=2019, end_year=2019, peakpower=system_capacity_kw, 
                                                        loss=total_system_losses_percent,pvtechchoice=module_type, angle=tilt, aspect=azimuth,
                                                        trackingtype=tracking_type_dict[tracking_type])
@@ -330,16 +208,14 @@ with tabs[1]:
                 peak_power_kw = production_data['ac_power_kw'].max()
                 capacity_factor = (total_annual_kwh / (system_capacity_kw * 8760)) * 100
                 specific_yield = total_annual_kwh / system_capacity_kw
-                #production_data.to_csv('Production_data.csv')
-                
+                              
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Ukupna godišnja proizvodnja", f"{total_annual_kwh:.2f} kWh")
                 col2.metric("Specifična proizvodnja", f"{specific_yield:.2f} kWh/kW") 
                 col2.metric("Faktor angažiranja solarne elektrane ", f"{capacity_factor:.2f} %")
                 col3.metric("Prosječna dnevna proizvodnja", f"{avg_daily_kwh:.2f} kWh")
-                col3.metric("Zabilježena vršna snaga", f"{peak_power_kw:.2f} kW")   
+                col3.metric("Zabilježena vršna snaga", f"{peak_power_kw:.2f} kW")  
                 
-
                 st.write("Za detaljan prikaz podataka o proizvodnji i potrošnji energije ispunite potrebne podatke u kartici 'Potrošnja' ")               
                            
             except Exception as e:
@@ -358,8 +234,7 @@ with tabs[2]:
         options=["Predefinirani profil", "Uploadirajte satne podatke"],
         index=0,  # Default to predefined
         key='input_mode_cons',
-        help="Predefinirani: unaprijed određeni profil ; Upload za podatke o vlastitoj potrošnji. Prebacivanje briše prethodne podatke"
-    )
+        help="Predefinirani: unaprijed određeni profil ; Upload za podatke o vlastitoj potrošnji. Prebacivanje briše prethodne podatke")
 
     if input_mode == "Predefinirani profil":
         # Clear any upload state when switching to predefined
@@ -630,12 +505,11 @@ with tabs[2]:
                 st.session_state['consumption_data'] = None
 
 
-
     # Display section (renders if computed data exists, updates reactively)
     if st.session_state.get('consumption_data') is not None:
-        data = st.session_state['consumption_data']
-        #production_data = st.session_state['production_data']        
+        data = st.session_state['consumption_data']              
         consumption_df=st.session_state['consumption_data']['consumption_df']
+
         def calculate_self_consumption_metrics(production_df, consumption_df):
             # Align indices (both should be 8760 hourly)
             common_index = production_df.index.intersection(consumption_df.index)
@@ -659,11 +533,9 @@ with tabs[2]:
                 'annual_load_kwh': annual_load,
                 'annual_self_consumed_kwh': annual_self_consumed,
                 'self_consumption_pct': round(self_consumption_ratio, 1),
-                'self_sufficiency_pct': round(self_sufficiency_ratio, 1)
-            }
+                'self_sufficiency_pct': round(self_sufficiency_ratio, 1)            }
 
-        metrics = calculate_self_consumption_metrics( prod_copy, consumption_df)
-        
+        metrics = calculate_self_consumption_metrics( prod_copy, consumption_df)        
         
         # Display summary statistics
         col1, col2, col3 = st.columns(3)
@@ -806,7 +678,6 @@ with tabs[2]:
     else:
         st.info("Kliknite na karticu Proizvodnja da biste izračunali proizvodnju, zatim izmijenite podatke o potrošnji za automatsko ažuriranje.")
 
-
 with tabs[3]:
     st.header("Godišnji račun")
     st.write("Izračun godišnjeg troška za električnu energiju")
@@ -856,9 +727,8 @@ with tabs[3]:
             col2.metric("15min netiranje", f"{total_15min:.2f} EUR")
             col3.metric("Bez solarne elektrane", f"{total_noPV:.2f} EUR") 
 
-            st.download_button("Preuzmi godišnji račun (CSV)", godišnji_month.to_csv(), "godisnji_racun.csv")          
+            st.download_button("Preuzmi godišnji račun (CSV)", godišnji_month.to_csv(), "godisnji_racun.csv")         
       
-
             # Combine into a DataFrame 
             df_3 = pd.DataFrame({
                 'Mjesec': month_names,
@@ -889,13 +759,9 @@ with tabs[3]:
             )
             st.plotly_chart(fig, use_container_width=True)   
                   
-            fig_bill = plot_bill_style_plotly(godišnji_month[godišnji_month.index<10])
-            #st.plotly_chart(fig_bill, use_container_width=True)
-            
+            fig_bill = plot_bill_style_plotly(godišnji_month[godišnji_month.index<10])                       
             fig_bill2 = plot_bill_style_plotly(godišnji_15min[godišnji_15min.index<10])
-
-            #fig_bill_matplot = plot_bill_style(godišnji_month[godišnji_month.index<10])
-            #st.pyplot(fig_bill_matplot) 
+ 
         col1, col2 = st.columns([1, 1])
         with col1: 
             st.write("Godišnji račun - mjesečno netiranje")
@@ -907,8 +773,7 @@ with tabs[3]:
     
     if st.button("Prikaži mjesečne račune za električnu energiju"):  
         racuni_month=st.session_state['racuni_month']
-        racuni_15min=st.session_state['racuni_15min']
-       
+        racuni_15min=st.session_state['racuni_15min']       
 
         with st.spinner("Pripremam mjesečne račune ..."):
             col1, col2 = st.columns([1, 1])
@@ -921,7 +786,7 @@ with tabs[3]:
                         {month}
                         </div>
                         """, unsafe_allow_html=True)
-                    #st.markdown("<br>", unsafe_allow_html=True) 
+                     
                     racun=racuni_month[month]
                     fig1 = plot_bill_style(racun[racun.index<10])
                     fig2 = plot_bill_style2(racun[(racun.index > 10) & (racun.index < 16)])
@@ -937,7 +802,7 @@ with tabs[3]:
                         {month}
                         </div>
                         """, unsafe_allow_html=True)
-                    #st.markdown("<br>", unsafe_allow_html=True) 
+                    
                     racun=racuni_15min[month]
                     fig1 = plot_bill_style(racun[racun.index<10])
                     fig2 = plot_bill_style2(racun[(racun.index > 10) & (racun.index < 16)])
@@ -972,11 +837,9 @@ with tabs[4]:
         annual_rate_increase = st.slider("Godišnja stopa rasta cijene el. energije (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
         inflation_rate = st.slider("Godišnja stopa inflacije (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
     
-    
     if st.button("Izvrši financijsku analizu"):
 
         start_time = time.time()
-
         # Placeholders for live timer and final message     
         timer_placeholder = st.empty()
         spinner_placeholder = st.spinner("Vršim financijsku analizu...")      
@@ -1140,7 +1003,6 @@ with tabs[4]:
                         metrics_cols[0].metric("Neto ukupni troškovi sa subvencijom", f"€{net_system_cost:,.2f}")
                         metrics_cols[0].metric("Početna investicija", f"€{equity_amount:,.2f}")
 
-
                         metrics_cols[0].write("Mj.netiranje")
                         metrics_cols[0].metric("Godišnja ušteda (za 1. godinu)", f"€{yearly_savings_month[1]:,.2f}")
                         metrics_cols[0].metric("Vrijeme povrata investicije (diskontirano)", f"{discounted_payback_years_month:.0f} g.")
@@ -1158,9 +1020,7 @@ with tabs[4]:
                         col1.metric("Ukupni troškovi SE", f"€{total_system_cost:,.2f}")
                         col1.metric("Neto ukupni troškovi sa subvencijom", f"€{net_system_cost:,.2f}")
                         col1.metric("Početna investicija", f"€{equity_amount:,.2f}")
-                        #col1.metric("Lista kumulativna", f"{yearly_cumulative_savings_month}")
-                        #col1.metric("Lista ušteda", f"{yearly_savings_month}")
-
+                     
                         col2.write("Mj.netiranje")
                         col2.metric("Godišnja ušteda (za 1. godinu)", f"€{yearly_savings_month[1]:,.2f}")
                         col2.metric("Vrijeme povrata investicije (diskontirano)", f"{discounted_payback_years_month:.0f} g."if discounted_payback_years_month <= 25 else "Ne isplati se u 25g")
@@ -1173,8 +1033,9 @@ with tabs[4]:
 
                         #col3.metric("25-Year ROI", f"{yearly_roi[-1]:.1f}%")
                         #col3.metric("25-Year Net Profit", f"€{yearly_cumulative_savings[-1]:,.2f}")
-                                        # Create cash flow chart
-                    st.subheader("25-Year Cash Flow")
+
+                    # Create cash flow chart
+                    st.subheader("25-godišnja analiza tokova novca")
 
                     plot_years = list(range(0, system_lifetime_years+1))
                     # Create DataFrame for cash flow
@@ -1223,7 +1084,7 @@ with tabs[4]:
                     
                     # Update layout for dual y-axes
                     fig.update_layout(
-                        title='25-god. analiza tokova novca',
+                        #title='25-god. analiza tokova novca',
                         xaxis=dict(title='Godina'),
                         yaxis=dict(title='God. ušteda (€)', side='left', showgrid=False),
                         #yaxis2=dict(title='Kumulativna ušteda (€)', side='right', overlaying='y', showgrid=False),
@@ -1234,17 +1095,13 @@ with tabs[4]:
                     st.plotly_chart(fig, use_container_width=True)
 
                     elapsed = time.time() - start_time
-                    timer_placeholder.info(f"⏱️ Proteklo vrijeme: **{elapsed:.1f} sekundi**")
+                    timer_placeholder.info(f"⏱️ Proteklo vrijeme: **{elapsed:.1f} sekundi**")                          
                             
-                            
-                                                   
  
 
 with tabs[5]:
     st.header("Rezultati")
-
-    # Financial inputs section
-    #st.subheader("Financijski parametri")
+   
     col1, col2 = st.columns(1) if st.session_state.get('_is_mobile', False) else st.columns(2)
 
     if st.session_state.get('consumption_data') is not None:
@@ -1254,7 +1111,7 @@ with tabs[5]:
         
         st.subheader("Mjesečni pregled bilance energije kod mjesečnog netiranja")
         st.write("Samo mjesečni viškovi proizvedene energije se obračunavaju po cijeni energije isporučene u mrežu, koja je značajno niža od cijene preuzete energije.")
-        st.write("U slučaju da je više energije potrošeno nego proizvedeno unutar mjeseca, čitava proizvedena energija je samopotrošena, tj. nema isporučene energije u mrežu.")
+        st.write("U slučaju da je više energije potrošeno nego proizvedeno unutar mjeseca, čitava proizvedena energija je samopotrošena, tj.ne obračunava se energija isporučena u mrežu.")
         # Create stacked bar chart
         fig = go.Figure()
         
@@ -1309,13 +1166,10 @@ with tabs[5]:
         
         st.plotly_chart(fig, use_container_width=True)
 
-
-
         # Create monthly breakdown chart
         st.subheader("Mjesečni pregled bilance energije kod 15minutnog netiranja")
-        st.write("Svi viškovi proizvedene energije unutar 15-minutnog perioda se obračunavaju po cijeni energije isporučene u mrežu, koja je značajno niža od cijene preuzete energije.")
-
-
+        st.write("Svi viškovi proizvedene energije unutar 15-minutnog perioda se obračunavaju po cijeni energije isporučene (plavo) u mrežu, koja je značajno niža od cijene preuzete energije (crveno).")
+    
         # Create stacked bar chart
         fig = go.Figure()
         
@@ -1357,15 +1211,8 @@ with tabs[5]:
             hovermode='x unified'
         )
         
-        st.plotly_chart(fig, use_container_width=True)
-                   
+        st.plotly_chart(fig, use_container_width=True)              
         
                 
-            
-    
         
-        
-        
-
-
 
