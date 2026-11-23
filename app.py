@@ -182,9 +182,7 @@ with tabs[1]:
         if 'time' in df.columns:
             df['time'] = pd.to_datetime(df['time'], format='%Y%m%d:%H%M')
         df.set_index('time', inplace=True)
-             
         return df
-
     
     # Calculate production if user clicks the button
     if st.button("Izračunaj proizvodnju SE"):
@@ -195,27 +193,17 @@ with tabs[1]:
                                                        loss=total_system_losses_percent,pvtechchoice=module_type, angle=tilt, aspect=azimuth,
                                                        trackingtype=tracking_type_dict[tracking_type])
 
-                #upsample to 15min intervals
-                start = production_data.index.min()
-                end = production_data.index.max() + pd.Timedelta(hours=1) - pd.Timedelta(minutes=15)
-                idx_15 = pd.date_range(start=start, end=end, freq="15min")                
-
-                out = production_data["P"].reindex(idx_15, method="ffill")
-                production_data = out.to_frame(name="P")
-                production_data["energy_kwh"] = production_data["P"] * 0.25   # kWh in each 15-min slot
+                production_data = production_data.shift(1, fill_value=0)
+                #production_data.to_csv('production_data1hr.csv')  # Save for debugging
                 
-                #production_data.to_csv('production_data15_filled.csv')  # Save for debugging
-
-                production_data['ac_power_kw'] = production_data["energy_kwh"]  / 1000  # Convert W to kW
-                production_data['P'] = production_data["P"]  / 1000  # Convert W to kW
-
+                production_data['ac_power_kw'] = production_data['P']  / 1000  # Convert W to kW
                 # Store the data in session state for use in other tabs
                 st.session_state['production_data'] = production_data
                 
                 # Display summary statistics
                 total_annual_kwh = production_data['ac_power_kw'].sum()
                 avg_daily_kwh = total_annual_kwh / 365
-                peak_power_kw = production_data['P'].max()
+                peak_power_kw = production_data['ac_power_kw'].max()
                 capacity_factor = (total_annual_kwh / (system_capacity_kw * 8760)) * 100
                 specific_yield = total_annual_kwh / system_capacity_kw
                               
@@ -261,7 +249,7 @@ with tabs[2]:
         # Consumption pattern options
         consumption_pattern = st.selectbox(
             "Uzorak potrošnje energije", 
-            options=["Primjer kućanstva", "Jednoliko distribuirana", "Veća potrošnja tijekom dana", "Veća potrošnja tijekom večeri", "Sezonska (veća potrošnja ljeti)", "Sezonska (veća potrošnja zimi)"],
+            options=["Jednoliko distribuirana", "Veća potrošnja tijekom dana", "Veća potrošnja tijekom večeri", "Sezonska (veća potrošnja ljeti)", "Sezonska (veća potrošnja zimi)"],
             index=0,
             key='consumption_pattern'
         )
@@ -269,15 +257,15 @@ with tabs[2]:
     elif input_mode == "Uploadirajte satne podatke":
         # Clear any predefined changes? Not needed, as we use upload exclusively here
         
-        st.write("Uploadirajte svoju 15-minutnu potrošnju električne energije u CSV ili Excel formatu.")        
-        st.write("Datoteka treba sadržavati vrijednosti 15-minutne potrošnje u  kWh za cijelu godinu (8760 sati * 4 = 35040 vrijednosti).")
+        st.write("Uploadirajte svoju satnu potrošnju električne energije u CSV ili Excel formatu.")        
+        st.write("Datoteka treba sadržavati vrijednosti satne potrošnje u kW ili kWh za cijelu godinu (8760 sati).")
         
         # File format explanation
         with st.expander("Format datoteke treba ispunjavati uvjete:"):
             st.markdown("""
             ### Potrebni format datotekje:
-            - CSV ili Excel datoteka sa podacima o 15-minutnoj potrošnji
-            - Datoteka treba sadržavati 35040 podataka (jedna puna godina 15-minutnih iznosa potrošnje)
+            - CSV ili Excel datoteka sa podacima o satnoj potrošnji
+            - Datoteka treba sadržavati 8760 podataka (jedna puna godina satnih iznosa potrošnje)
             - Podaci trebaju biti unešeni u jedan stupac bez naslova
             - Vrijednosti potrošnje trebaju biti u kW ili kWh
             
@@ -291,7 +279,7 @@ with tabs[2]:
             
             ### Izborne opcije:
             - Ako datoteka sadrži stupac sa datumom i vremenom, možete specificirati koji stupac sadrži vrijednosti potrošnje        
-            - Ako datoteka sadrži manje od 35040 podataka o potrošnji, podaci će se ponavljati dok se ne popuni čitava godina
+            - Ako datoteka sadrži manje od 8760 podataka o potrošnji, podaci će se ponavljati dok se ne popuni čitava godina
             """)
         
         # File uploader
@@ -355,8 +343,8 @@ with tabs[2]:
                 prod_copy = st.session_state['production_data'].copy()
                 
                 # Generate hourly consumption profile based on input method
-                values_in_year = 35040
-                hourly_consumption = np.zeros(values_in_year)
+                hours_in_year = 8760
+                hourly_consumption = np.zeros(hours_in_year)
                 
                 # Check if user uploaded consumption data (current state)
                 uploaded_file = st.session_state.get('consumption_file')
@@ -387,16 +375,16 @@ with tabs[2]:
                                 consumption_df_raw = pd.read_excel(uploaded_file, header=None, skiprows=skip_rows)
                                 consumption_values = consumption_df_raw.iloc[:, column_index].values
                         
-                        # Handle case where uploaded data doesn't have exactly 35040 values
-                        if len(consumption_values) < values_in_year:
+                        # Handle case where uploaded data doesn't have exactly 8760 values
+                        if len(consumption_values) < hours_in_year:
                             # Repeat the data to fill a full year
-                            repetitions = int(np.ceil(values_in_year / len(consumption_values)))
-                            consumption_values = np.tile(consumption_values, repetitions)[:values_in_year]
-                            st.info(f"Uploaded data had {len(consumption_values)} values, repeated to fill 35040 values.")
-                        elif len(consumption_values) > values_in_year:
-                            # Truncate to 35040 values
-                            consumption_values = consumption_values[:values_in_year]
-                            st.info(f"Uploaded data had more than 35040 values, truncated to first 35040 values .")
+                            repetitions = int(np.ceil(hours_in_year / len(consumption_values)))
+                            consumption_values = np.tile(consumption_values, repetitions)[:hours_in_year]
+                            st.info(f"Uploaded data had {len(consumption_values)} values, repeated to fill 8760 hours.")
+                        elif len(consumption_values) > hours_in_year:
+                            # Truncate to 8760 values
+                            consumption_values = consumption_values[:hours_in_year]
+                            st.info(f"Uploaded data had more than 8760 values, truncated to first 8760 hours.")
                         
                         # Use the uploaded consumption values
                         hourly_consumption = consumption_values
@@ -415,17 +403,13 @@ with tabs[2]:
                 
                 # Use predefined patterns if no upload or if there was an error
                 if use_predefined_pattern:
-                    if consumption_pattern == "Primjer kućanstva":
-                        hourly_consumption = pd.read_csv("Load_data_15min.csv", header=None).values.flatten()
-
-                    elif consumption_pattern == "Jednoliko distribuirana":
-                        hourly_consumption = np.ones(values_in_year) * (annual_consumption / values_in_year)
+                    if consumption_pattern == "Jednoliko distribuirana":
+                        hourly_consumption = np.ones(hours_in_year) * (annual_consumption / hours_in_year)
                     
                     elif consumption_pattern == "Veća potrošnja tijekom dana":
                         # More consumption during daytime (8am-6pm)
-                        for i in range(values_in_year):
-                            #hour = i % 24
-                            hour=prod_copy.index[i].hour
+                        for i in range(hours_in_year):
+                            hour = i % 24
                             if 8 <= hour < 18:  # Daytime hours
                                 hourly_consumption[i] = 1.5
                             else:
@@ -435,8 +419,8 @@ with tabs[2]:
                     
                     elif consumption_pattern == "Veća potrošnja tijekom večeri":
                         # More consumption during evening (5pm-11pm)
-                        for i in range(values_in_year):
-                            hour=prod_copy.index[i].hour
+                        for i in range(hours_in_year):
+                            hour = i % 24
                             if 17 <= hour < 23:  # Evening hours
                                 hourly_consumption[i] = 2.0
                             else:
@@ -446,7 +430,7 @@ with tabs[2]:
                     
                     elif consumption_pattern == "Sezonska (veća potrošnja ljeti)":
                         # More consumption in summer months (May-Sep)
-                        for i in range(values_in_year):
+                        for i in range(hours_in_year):
                             month = prod_copy.index[i].month
                             if 5 <= month <= 9:  # Summer months
                                 hourly_consumption[i] = 1.5
@@ -457,7 +441,7 @@ with tabs[2]:
                     
                     elif consumption_pattern == "Sezonska (veća potrošnja zimi)":
                         # More consumption in winter months (Nov-Mar)
-                        for i in range(values_in_year):
+                        for i in range(hours_in_year):
                             month = prod_copy.index[i].month
                             if month <= 3 or month >= 11:  # Winter months
                                 hourly_consumption[i] = 1.5
@@ -491,11 +475,11 @@ with tabs[2]:
                 # Pre-calculate metrics for display
                 total_annual_load_kWh = consumption_df['consumption_kw'].sum()
                 avg_daily_load_kwh = total_annual_load_kWh / 365
-                peak_power_load_kw = consumption_df['consumption_kw'].max()*4
+                peak_power_load_kw = consumption_df['consumption_kw'].max()
                 
                 total_annual_kwh = prod_copy['ac_power_kw'].sum()
                 avg_daily_kwh = total_annual_kwh / 365
-                peak_power_kw = prod_copy['ac_power_kw'].max()*4
+                peak_power_kw = prod_copy['ac_power_kw'].max()
                 
                 # Store computed data in session state for display (overwrites on each update)
                 st.session_state['consumption_data'] = {
@@ -511,7 +495,7 @@ with tabs[2]:
                 
                 st.success("Podaci o potrošnji ažurirani!")
 
-                consumption_df.to_csv('consumption_df.csv')
+                #consumption_df.to_csv('consumption_df.csv')
                 
             except Exception as e:
                 st.error(f"Greška pri obradi podataka: {str(e)}")
@@ -599,7 +583,7 @@ with tabs[2]:
         st.plotly_chart(fig, use_container_width=True)
         
         # Create hourly heatmap for daily consumption patterns
-        hourly_data = data['consumption_df'].copy()*4
+        hourly_data = data['consumption_df'].copy()
         hourly_data['hour'] = data['consumption_df'].index.hour
         hourly_data['month'] = data['consumption_df'].index.month
         
@@ -628,7 +612,7 @@ with tabs[2]:
         st.plotly_chart(fig, use_container_width=True)
 
         # Create hourly heatmap for daily production patterns
-        hourly_data = prod_copy.copy()*4
+        hourly_data = prod_copy.copy()
         hourly_data['hour'] = prod_copy.index.hour
         hourly_data['month'] = prod_copy.index.month
         
@@ -664,8 +648,8 @@ with tabs[2]:
                                     index=6, key='sample_month_cons')  # Default to July, with key for state
         
         # Filter data for selected month
-        month_data = prod_copy[prod_copy.index.month == sample_month]*4
-        month_load_data = data['consumption_df'][data['consumption_df'].index.month == sample_month]*4
+        month_data = prod_copy[prod_copy.index.month == sample_month]
+        month_load_data = data['consumption_df'][data['consumption_df'].index.month == sample_month]
         
         # Group by hour of day
         hourly_avg = month_data.groupby(month_data.index.hour)['ac_power_kw'].mean()
@@ -1281,4 +1265,3 @@ with tabs[5]:
         
                 
         
-
