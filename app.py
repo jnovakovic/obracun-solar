@@ -142,7 +142,7 @@ with tabs[1]:
         Returns:
         - pd.DataFrame: DataFrame with hourly radiation data.
         """
-        base_url = "https://re.jrc.ec.europa.eu/api/v5_2/seriescalc"
+        base_url = "https://re.jrc.ec.europa.eu/api/v5_3/seriescalc"
         
         params = {
             "lat": latitude,
