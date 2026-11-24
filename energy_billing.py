@@ -35,7 +35,8 @@ def energy_calculation (production_data, consumption_df,sub_kWh):
     stanje_od_from_Grid_LT=0       
 
     for month in months:    
-        monthly_data=load_pv[load_pv.index.month<=month]    
+        #monthly_data=load_pv[load_pv.index.month<=month]    
+        monthly_data=load_pv[load_pv.index.month==month]
        
         #HT_hours=monthly_data.between_time('07:00','20:00').index
         #LT_hours=monthly_data.between_time('21:00','06:00').index  
@@ -43,7 +44,7 @@ def energy_calculation (production_data, consumption_df,sub_kWh):
         HT_hours = monthly_data.between_time('07:00', '21:00', inclusive='left').index
         LT_hours = monthly_data.index.difference(HT_hours)   
         
-        stanje_do_HT=sum(monthly_data.loc[HT_hours,'Load'])    
+        """ stanje_do_HT=sum(monthly_data.loc[HT_hours,'Load'])    
         stanje_do_LT=sum(monthly_data.loc[LT_hours,'Load'])  
 
         stanje_do_PV_HT=sum(monthly_data.loc[HT_hours,'PV_kWh'])    
@@ -53,7 +54,21 @@ def energy_calculation (production_data, consumption_df,sub_kWh):
         stanje_do_to_Grid_LT=sum(monthly_data.loc[LT_hours,'to_Grid_kWh']) 
 
         stanje_do_from_Grid_HT=sum(monthly_data.loc[HT_hours,'from_Grid_kWh'])    
-        stanje_do_from_Grid_LT=sum(monthly_data.loc[LT_hours,'from_Grid_kWh']) 
+        stanje_do_from_Grid_LT=sum(monthly_data.loc[LT_hours,'from_Grid_kWh'])  """
+
+        stanje_do_HT=stanje_od_HT+monthly_data.loc[HT_hours,'Load'].sum()
+        stanje_do_LT=stanje_od_LT+monthly_data.loc[LT_hours,'Load'].sum()
+
+        stanje_do_PV_HT=stanje_od_PV_HT+monthly_data.loc[HT_hours,'PV_kWh'].sum()
+        stanje_do_PV_LT=stanje_od_PV_LT+monthly_data.loc[LT_hours,'PV_kWh'].sum()
+
+        stanje_do_to_Grid_HT=stanje_od_to_Grid_HT+monthly_data.loc[HT_hours,'to_Grid_kWh'].sum()
+        stanje_do_to_Grid_LT=stanje_od_to_Grid_LT+monthly_data.loc[LT_hours,'to_Grid_kWh'].sum()
+
+        stanje_do_from_Grid_HT=stanje_od_from_Grid_HT+monthly_data.loc[HT_hours,'from_Grid_kWh'].sum()
+        stanje_do_from_Grid_LT=stanje_od_from_Grid_LT+monthly_data.loc[LT_hours,'from_Grid_kWh'].sum()
+
+
     
         Load_HT_kWh=round(stanje_do_HT-stanje_od_HT,2)
         Load_LT_kWh=round(stanje_do_LT-stanje_od_LT,2) 
@@ -144,6 +159,41 @@ def energy_calculation (production_data, consumption_df,sub_kWh):
                                            
     return obracun 
 
+class FastBill:
+    """Works like a DataFrame (.loc[row, col]) but stores values in a dict."""
+    COLS = ['Opis', 'Iznos EUR']
+
+    def __init__(self):
+        self.data = {}
+        self.cols = list(self.COLS)
+        self.loc = self
+
+    @property
+    def index(self):
+        return np.array(list(self.data))
+
+    def _rows(self, r):
+        if isinstance(r, slice):
+            return [k for k in self.data if r.start <= k <= r.stop]
+        if isinstance(r, np.ndarray):
+            return [k for k, m in zip(self.data, r) if m]
+        return list(r)
+
+    def __getitem__(self, key):
+        r, c = key
+        if isinstance(r, (slice, list, np.ndarray)):
+            return pd.Series([self.data[k].get(c, np.nan) for k in self._rows(r)], dtype=float)
+        return self.data.get(r, {}).get(c, np.nan)
+
+    def __setitem__(self, key, value):
+        r, c = key
+        if c not in self.cols:
+            self.cols.append(c)
+        self.data.setdefault(r, {})[c] = value
+
+    def to_frame(self):
+        return pd.DataFrame.from_dict(self.data, orient='index', columns=self.cols).sort_index()
+
 def create_invoice(net_interval, obracun,prices_df,sub_kWh, kSO): 
      
     prices_dict=prices_df.to_dict('records')[0]  
@@ -156,7 +206,8 @@ def create_invoice(net_interval, obracun,prices_df,sub_kWh, kSO):
     for mjesec in lista_mjeseci:
         i+=1
         key = f'{mjesec}'
-        racuni[key] = pd.DataFrame(columns=['Opis','Iznos EUR']) 
+        #racuni[key] = pd.DataFrame(columns=['Opis','Iznos EUR'])
+        racuni[key] = FastBill()
 
         # Detaljni prikaz stavki računa
         racuni[key].loc[10, 'Opis'] = ''
@@ -353,7 +404,8 @@ def create_invoice(net_interval, obracun,prices_df,sub_kWh, kSO):
         racuni[key].loc[33, 'Cijena EUR/kWh'] =sell_price_LT
         racuni[key].loc[33, 'Iznos EUR']=round(racuni[key].loc[33, 'Količina']*racuni[key].loc[33, 'Cijena EUR/kWh'],2)
 
-        racuni[key] = racuni[key].sort_index()
+        #racuni[key] = racuni[key].sort_index()
+        racuni[key] = racuni[key].to_frame()
 
     return racuni  
 
