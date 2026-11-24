@@ -220,8 +220,8 @@ with tabs[0]:
 with tabs[1]:
     st.header("Proizvodnja energije solarne elektrane")
     st.write("Satna proizvodnja iz PVGIS-a (EU JRC), pretvorena iz UTC-a u srednjoeuropsko vrijeme i raspodijeljena na 15-minutne intervale.")
-    pv_year = st.selectbox("Meteorološka godina (PVGIS)", list(range(2005, 2024)), index=2019 - 2005,
-                           help="2019. je godina čija je proizvodnja najbliža desetogodišnjem prosjeku izmjerenom na FESB-u.")
+    pv_year = st.selectbox("Meteorološka godina (PVGIS)", list(range(2005, 2024)), index=2023 - 2005,
+                           help="PVGIS koristi meteorološke podatke iz 2005. – 2023. godine; odaberite godinu koja najbolje odgovara očekivanim uvjetima.")
     pv_params = (round(latitude, 4), round(longitude, 4), int(pv_year), float(system_capacity_kw), int(losses), int(tilt),
                  int(azimuth), module_type, "free", TRACKING[tracking])
     if st.button("Izračunaj proizvodnju SE", type="primary"):
