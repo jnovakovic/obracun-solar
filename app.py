@@ -1,1298 +1,519 @@
-import streamlit as st
+import io
+import os
+import time
+from pathlib import Path
+
+import folium
 import numpy as np
 import pandas as pd
-#from energy_billing import izvrši_obracun, plot_bill_style, display_bill_table, plot_bill_style_plotly,plot_bill_style2, plot_bill_style3   
-from energy_billing import izvrši_obracun, energy_calculation, create_invoice, year_total, plot_bill_style, display_bill_table, plot_bill_style_plotly,plot_bill_style2, plot_bill_style3
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
-import folium
-from streamlit_folium import st_folium
 import requests
-import time
+import streamlit as st
+from streamlit_folium import st_folium
+
+import energy_billing as eb
+
+# Model assumptions
+SETTLEMENT = dict(threshold_on_import=False,     # 3,000 kWh threshold counts netted kWh in both schemes
+                  pkc_includes_subsidy=False)    # PKC = energy price weighted by VT/NT imports only
+FINANCE = dict(discount_first_year=False,        # year y discounted with (1+r)^(y-1)
+               escalate_all_prices=True,         # all price items grow with the escalation rate
+               inflate_inverter=False,           # inverter replacement at today's cost
+               **SETTLEMENT)
+
+st.set_page_config(page_title="Kalkulator isplativosti SE", page_icon="☀️",
+                   layout="wide", initial_sidebar_state="expanded")
+
+# All series use one fixed, non-leap calendar in CET (UTC+1, no DST), 15-minute resolution.
+REF_YEAR = 2019
+N15 = 35040
+INDEX_15 = pd.date_range(f"{REF_YEAR}-01-01", periods=N15, freq="15min")
+MONTHS = eb.MJESECI
+MONTH_ABBR = ['Sij', 'Velj', 'Ožu', 'Tra', 'Svi', 'Lip', 'Srp', 'Kol', 'Ruj', 'Lis', 'Stu', 'Pro']
+TARIFFS = ["Bijeli (VT_NT)", "Plavi (JT)", "Crveni (VT_NT)", "Crni (JT)"]
+LABEL = {'noPV': 'Bez SE', 'month': 'Mjesečno netiranje', '15min': 'Neto obračun (15 min)'}
+COLOR = {'noPV': '#a3a3a3', 'month': '#2ca02c', '15min': '#2c5ea0', 'pv': '#FFA500', 'load': '#1f77b4'}
+CUSTOMER = {
+    "Kućanstvo – samoopskrba": 1.0,
+    "Poduzetništvo": eb.FACTOR_BUSINESS,
+}
+TRACKING = {"Fiksni položaj modula": 0, "Horizontalna os S-J": 1, "Dvoosni": 2, "Vertikalna os": 3, "Horizontalna os I-Z": 4}
+PATTERNS = ["Primjer kućanstva", "Jednoliko distribuirana", "Veća potrošnja tijekom dana",
+            "Veća potrošnja tijekom večeri", "Sezonska (veća potrošnja ljeti)", "Sezonska (veća potrošnja zimi)"]
 
 
-# Set page configuration
-st.set_page_config(
-    page_title="Kalkulator isplativosti solarne elektrane",
-    page_icon="☀️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+def show(fig):
+    st.plotly_chart(fig)
 
-#reset load data
-st.session_state['consumption_data'] = None
 
-# Load custom CSS for mobile optimization
+def years_text(v):
+    return f"{v:.1f} g." if v is not None else "Ne isplati se"
+
+
+HERE = Path(__file__).resolve().parent                 # data files are next to the app (or one folder up)
+os.chdir(HERE if (HERE / 'mobile_styles.css').exists() else HERE.parent)
+
 with open('mobile_styles.css', 'r') as f:
-    css = f.read()
-st.markdown(f'<style>{css}</style>', unsafe_allow_html=True)
+    st.markdown(f'<style>{f.read()}</style>', unsafe_allow_html=True)
 
-# Add JavaScript for mobile detection
-st.markdown("""
-<script>
-    // Check if the device is mobile
-    if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
-        // Set a session state variable to indicate mobile device
-        const data = {
-            _is_mobile: true
-        };
-        
-        // Send the data to Streamlit
-        window.parent.postMessage({
-            type: "streamlit:setComponentValue",
-            value: data
-        }, "*");
-    }
-</script>
-""", unsafe_allow_html=True)
+# --------------------------------------------------------------------------- cached computations
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_pvgis(lat, lon, year, peakpower, loss, angle, aspect, tech, mounting, tracking):
+    """Hourly PV output from PVGIS 5.3. Time stamps are UTC at HH:10 (PVGIS convention)."""
+    params = {"lat": lat, "lon": lon, "startyear": year, "endyear": year, "peakpower": peakpower, "loss": loss,
+              "angle": angle, "aspect": aspect, "pvtechchoice": tech, "mountingplace": mounting,
+              "trackingtype": tracking, "optimalinclination": 0, "optimalangles": 0, "pvcalculation": 1,
+              "components": 0, "outputformat": "json", "browser": 0}
+    r = requests.get("https://re.jrc.ec.europa.eu/api/v5_3/seriescalc", params=params, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"PVGIS: {r.status_code} - {r.text[:300]}")
+    hourly = r.json().get("outputs", {}).get("hourly", [])
+    if not hourly:
+        raise RuntimeError("PVGIS nije vratio satne podatke.")
+    df = pd.DataFrame(hourly)
+    df['time'] = pd.to_datetime(df['time'], format='%Y%m%d:%H%M')
+    return df.set_index('time')
 
-# App title and description
+
+def pvgis_to_15min(raw):
+    """PVGIS hourly (UTC) -> 15-minute series on the CET reference calendar.
+    The value stamped HH:10 UTC is the energy of hour HH..HH+1 UTC = HH+1..HH+2 CET, so the series moves one
+    hour later; 29 February is dropped so every year maps onto the same 8,760 hours as the load profiles."""
+    raw = raw[~((raw.index.month == 2) & (raw.index.day == 29))]
+    if len(raw) != 8760:
+        raise ValueError(f"Očekivano 8760 satnih vrijednosti, dobiveno {len(raw)}.")
+    p_kw = raw['P'].to_numpy(dtype=float) / 1000
+    p_kw = np.r_[0.0, p_kw[:-1]]                       # UTC -> CET
+    p15 = np.repeat(p_kw, 4)
+    return pd.DataFrame({'P': p15, 'ac_power_kw': p15 * 0.25}, index=INDEX_15)   # P in kW, ac_power_kw in kWh/15 min
+
+
+@st.cache_data(show_spinner=False)
+def predefined_profile(pattern, annual_kwh):
+    h, m = INDEX_15.hour.to_numpy(), INDEX_15.month.to_numpy()
+    if pattern == "Primjer kućanstva":
+        x = pd.read_csv("Load_data_15min.csv", header=None)[0].to_numpy(dtype=float)[:N15]
+    elif pattern == "Veća potrošnja tijekom dana":
+        x = np.where((h >= 8) & (h < 18), 1.5, 0.5)
+    elif pattern == "Veća potrošnja tijekom večeri":
+        x = np.where((h >= 17) & (h < 23), 2.0, 0.5)
+    elif pattern == "Sezonska (veća potrošnja ljeti)":
+        x = np.where((m >= 5) & (m <= 9), 1.5, 0.5)
+    elif pattern == "Sezonska (veća potrošnja zimi)":
+        x = np.where((m <= 3) | (m >= 11), 1.5, 0.5)
+    else:
+        x = np.ones(N15)
+    return x * annual_kwh / x.sum()
+
+
+@st.cache_data(show_spinner=False)
+def read_upload(data, name, skip_rows, has_header, column, unit, decimal):
+    """Returns (kWh per 15 min, notes). Accepts 15-min (35,040) or hourly (8,760) values, leap years included."""
+    buf = io.BytesIO(data)
+    header = 0 if has_header else None
+    if name.lower().endswith('.csv'):
+        first = next((ln for ln in data.decode('utf-8', 'ignore').splitlines()[skip_rows:] if ln.strip()), '')
+        sep = ';' if ';' in first else '\t' if '\t' in first else (';' if decimal == ',' else ',')
+        df = pd.read_csv(buf, header=header, skiprows=skip_rows, sep=sep, decimal=decimal)
+    else:
+        df = pd.read_excel(buf, header=header, skiprows=skip_rows)
+    s = df[column] if has_header else df.iloc[:, int(column)]
+    if s.dtype == object or pd.api.types.is_string_dtype(s):
+        s = s.astype(str).str.replace(',', '.', regex=False)
+    v = pd.to_numeric(s, errors='coerce').dropna().to_numpy(dtype=float)
+    notes = []
+    if len(v) in (8784, 35136):                       # leap year: drop 29 February
+        per_day = 24 if len(v) == 8784 else 96
+        v = np.r_[v[:59 * per_day], v[60 * per_day:]]
+        notes.append("Prijestupna godina: uklonjen je 29. veljače.")
+    if len(v) == 8760:
+        kwh_h = v if unit == "kWh" else v * 1.0        # mean kW over an hour = kWh in that hour
+        notes.append("Prepoznati su satni podaci; svaki sat je jednoliko podijeljen na četiri 15-minutna intervala.")
+        return np.repeat(kwh_h / 4, 4), notes
+    kwh = v if unit == "kWh" else v * 0.25
+    if len(kwh) < N15:
+        notes.append(f"Datoteka ima {len(kwh)} vrijednosti; ponavljaju se do 35.040 vrijednosti.")
+        kwh = np.tile(kwh, int(np.ceil(N15 / len(kwh))))[:N15]
+    elif len(kwh) > N15:
+        notes.append(f"Datoteka ima {len(kwh)} vrijednosti; koristi se prvih 35.040.")
+        kwh = kwh[:N15]
+    return kwh, notes
+
+
+@st.cache_data(show_spinner=False)
+def run_settlement(pv, load, tariff, k, sub_kwh):
+    prices = pd.read_csv(f"{tariff}.csv")
+    prod = pd.DataFrame({'ac_power_kw': pv}, index=INDEX_15)
+    cons = pd.DataFrame({'consumption_kw': load}, index=INDEX_15)
+    zero = pd.DataFrame({'ac_power_kw': np.zeros(N15)}, index=INDEX_15)
+    out = {'noPV': eb.izvrši_obracun(zero, cons, prices, sub_kwh, 'month'),
+           'month': eb.izvrši_obracun(prod, cons, prices, sub_kwh, 'month'),
+           '15min': eb.izvrši_obracun(prod, cons, prices, sub_kwh, '15min', k, **SETTLEMENT)}
+    return prices, out
+
+
+@st.cache_data(show_spinner=False)
+def run_finance(pv, load, tariff, k, sub_kwh, capacity_kw, params):
+    prices = pd.read_csv(f"{tariff}.csv")
+    return eb.analiza_isplativosti(pv, load, INDEX_15, prices, capacity_kw, sub_kWh=sub_kwh, kSO=k, **params, **FINANCE)
+
+
+def show_bill(r):
+    num = st.column_config.NumberColumn
+    st.dataframe(r.loc[1:9, ['Opis', 'Iznos EUR']], hide_index=True,
+                 column_config={'Iznos EUR': num(format="%.2f")})
+    st.dataframe(r.loc[12:15, ['Opis', 'Stanje od', 'Stanje do', 'Potrošak']], hide_index=True,
+                 column_config={'Stanje od': num(format="%.2f"), 'Stanje do': num(format="%.2f"), 'Potrošak': num(format="%.0f")})
+    st.dataframe(r.loc[16:33, ['Opis', 'Količina', 'Jedinica mjere', 'Cijena EUR/kWh', 'Iznos EUR']], hide_index=True,
+                 column_config={'Količina': num(format="%.0f"), 'Cijena EUR/kWh': num(format="%.6f"), 'Iznos EUR': num(format="%.2f")})
+
+
+# --------------------------------------------------------------------------- page
+ss = st.session_state
+ss.setdefault('lat', 43.5147)
+ss.setdefault('lon', 16.4435)
+if 'pending_click' in ss:                               # apply a map click before the inputs are drawn
+    ss['lat'], ss['lon'] = ss.pop('pending_click')
+
 st.title("☀️ Kalkulator isplativosti solarne elektrane")
 st.markdown("""
-Aplikacija  daje usporedbu profitabilnosti male solarne elektrane pod različitim načinima obračuna troška električne energije (mjesečno netiranje vs. 15 minutno netiranje energije). \n
-Unesite svoju lokaciju, specifikacije sustava i financijske parametre kako biste vidjeli detaljne rezultate i njihove prikaze.
+Usporedba isplativosti male solarne elektrane kućanstva za dva načina obračuna električne energije:
+**mjesečno netiranje** (zahtjevi za priključenje predani do 31. 12. 2025., čl. 51. st. 21. ZOIEVUK-a) i
+**neto obračun** (od 1. 1. 2026., čl. 51. st. 7.), kod kojeg se preuzeta i predana energija određuju u
+15-minutnim intervalima, a predana energija vrednuje po cijeni opskrbe umanjenoj prema omjeru preuzete i predane energije.
 """)
 
-# Create sidebar for inputs
-st.sidebar.header("Ulazni parametri")
+tabs = st.tabs(["Lokacija & Sustav", "Proizvodnja", "Potrošnja", "Godišnji račun", "Financijska analiza", "Rezultati"])
 
-# Main content will be organized in tabs
-tabs = st.tabs(["Lokacija & Sustav","Proizvodnja","Potrošnja", "Godišnji račun", "Financijska analiza", "Rezultati"])
-
-# Initialize session state for latitude and longitude if not already set
-if 'latitude' not in st.session_state:
-    st.session_state.latitude = 43.5147  # Split
-if 'longitude' not in st.session_state:
-    st.session_state.longitude = 16.4435
-
-# Callbacks to update session state when inputs change
-def update_latitude():
-    st.session_state.latitude = st.session_state.lat_input
-
-def update_longitude():
-    st.session_state.longitude = st.session_state.lon_input
-
+# --------------------------------------------------------------------------- 0 location & system
 with tabs[0]:
     st.header("Lokacija & parametri sustava")
-    st.write("Izaberite svoju lokaciju i unesite parametre solarne elektrane.")
-    
-    # Location section
-    st.subheader("Lokacija")
-    
-    # Use a single column on mobile, two columns on larger screens
-    use_cols = st.columns([1]) if st.session_state.get('_is_mobile', False) else st.columns(2)
-    
-    with use_cols[0]:
-        default_lat = 43.5147  # Split
-        default_lon = 16.4435
-        latitude = st.number_input("Latitude", min_value=-90.0, max_value=90.0, value=st.session_state.latitude, step=0.01, format="%.4f")
-        longitude = st.number_input("Longitude", min_value=-180.0, max_value=180.0, value=st.session_state.longitude, step=0.01, format="%.4f")
-        altitude = st.number_input("Altitude (m)", min_value=0, max_value=5000, value=10, step=10)
-        timezone = st.selectbox("Timezone", options=["Europe/Berlin","Europe/London","US/Eastern", "US/Central", "US/Mountain", "US/Pacific",   "Asia/Tokyo", "Australia/Sydney"], index=0)
-    
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Lokacija")
+        latitude = st.number_input("Geografska širina", min_value=-90.0, max_value=90.0, step=0.01, format="%.4f", key='lat')
+        longitude = st.number_input("Geografska dužina", min_value=-180.0, max_value=180.0, step=0.01, format="%.4f", key='lon')
         m = folium.Map(location=[latitude, longitude], zoom_start=10)
-        folium.Marker(
-            [latitude, longitude],
-            popup="Solar Installation Site",
-            tooltip="Solar Installation Site",
-            icon=folium.Icon(color="orange", icon="sun", prefix="fa")
-        ).add_to(m)
-        
-        # Display the map with smaller size for mobile
-        st.write("Lokacija:")
-        map_data = st_folium(m, width=900, height=300, returned_objects=["last_clicked"])
+        folium.Marker([latitude, longitude], tooltip="Lokacija elektrane",
+                      icon=folium.Icon(color="orange", icon="sun", prefix="fa")).add_to(m)
+        st.caption("Kliknite na kartu za odabir lokacije.")
+        map_data = st_folium(m, height=300, use_container_width=True, returned_objects=["last_clicked"], key='map')
+        click = (map_data or {}).get("last_clicked")
+        if click:
+            c = (round(click["lat"], 4), round(click["lng"], 4))
+            if c != ss.get('last_click_seen'):
+                ss['last_click_seen'] = c
+                ss['pending_click'] = c
+                st.rerun()
+    with c2:
+        st.subheader("Parametri solarne elektrane")
+        system_capacity_kw = st.number_input("Instalirana snaga solarne elektrane (kW)", min_value=0.5, max_value=100.0, value=4.5, step=0.1)
+        module_type = st.selectbox("Tip modula", ["crystSi", "CIS", "CdTe"], index=0)
+        losses = st.slider("Gubici u sustavu (%)", 0, 30, 14, 1)
+        tilt = st.number_input("Kut nagiba modula (°)", min_value=0, max_value=90, value=20, step=1)
+        azimuth = st.number_input("Azimut (°, 0 = jug, -90 = istok, 90 = zapad)", min_value=-180, max_value=180, value=0, step=1)
+        tracking = st.selectbox("Tip praćenja sunca", list(TRACKING), index=0)
 
-        # If a click is detected, update session state and rerun to refresh inputs/map
-        if map_data and map_data.get("last_clicked"):
-            st.session_state.latitude = map_data["last_clicked"]["lat"]
-            st.session_state.longitude = map_data["last_clicked"]["lng"]
-            st.rerun()
-    
-    # System configuration section
-    st.subheader("Parametri solarne elektrane")
-    
-    # Use a single column on mobile, two columns on larger screens
-    col1, col2 = st.columns(1) if st.session_state.get('_is_mobile', False) else st.columns(2)
-    
-    with col1:
-        system_capacity_kw = st.number_input("Instalirana snaga solarne elektrane  (kW)", min_value=0.5, max_value=100.0, value=4.5, step=0.1)
-        module_type = st.selectbox("Tip modula", options=["crystSi", "CIS", "CdTe"], index=0)
-        total_system_losses_percent = st.slider("Gubici u sustavu (%)", min_value=0, max_value=30, value=14, step=1)
-        
-    with col2:
-        tilt = st.number_input("Kut nagiba modula (stupnjevi)", min_value=0, max_value=90, value=20, step=1)
-        azimuth = st.number_input("Azimut (stupnjevi, 0=Jug)", min_value=-180, max_value=180, value=0, step=1)
-        tracking_type = st.selectbox("Tip praćenja sunca ", options=["Fiksni položaj modula","Horizontalna os S-J", "Dvoosni", "Vertikalna os","Horizontalno I-Z"], index=0)
-        tracking_type_dict = {"Fiksni položaj modula": 0, "Horizontalna os S-J": 1, "Dvoosni": 2, "Vertikalna os": 3, "Horizontalno I-Z": 4}                         
-             
+
+# --------------------------------------------------------------------------- 1 production
 with tabs[1]:
     st.header("Proizvodnja energije solarne elektrane")
-    st.write("Procijenjena proizvodnja električne energije solarne elektrane prema lokaciji i parametrima sustava.")
-    
-    def get_hourly_radiation(latitude, longitude, start_year=2019, end_year=2019, peakpower=system_capacity_kw, loss=14, angle=20, aspect=0, pvtechchoice='crystSi', mountingplace='free', trackingtype=0):
-        """
-        Fetch hourly solar radiation data from PVGIS API.
-        
-        Parameters:
-        - lat (float): Latitude of the location.
-        - lon (float): Longitude of the location.
-        - start_year (int): Starting year for data (optional, defaults to 2005).
-        - end_year (int): Ending year for data (optional, defaults to 2020).
-        
-        Returns:
-        - pd.DataFrame: DataFrame with hourly radiation data.
-        """
-        base_url = "https://re.jrc.ec.europa.eu/api/v5_3/seriescalc"
-        
-        params = {
-            "lat": latitude,
-            "lon": longitude,
-            "startyear": start_year,
-            "endyear": end_year,
-            "peakpower": peakpower,
-            "loss": loss,
-            "angle": angle,
-            "aspect": aspect,
-            "pvtechchoice": pvtechchoice,  # Crystalline Silicon
-            "mountingplace": mountingplace,  # Free-standing
-            "trackingtype": trackingtype,          # 0 = fixed
-            "optimalinclination": 0,  # 0 = use specified angle
-            "optimalangles" : 0,      # 0 = use specified aspect
-            "pvcalculation": 1,  # 0 = only radiation, 1 = include PV production
-            "components": 0,     # 1 = include beam/diffuse/reflected components
-            "outputformat": "json",
-            "browser": 0         # 0 = stream response
-        }
-        
-        response = requests.get(base_url, params=params)        
-        if response.status_code != 200:
-            raise Exception(f"API request failed: {response.status_code} - {response.text}")        
-        data = response.json()
-        
-        # Extract the hourly data from the JSON response
-        hourly_list = data.get("outputs", {}).get("hourly", [])
-        
-        if not hourly_list:
-            raise Exception("No hourly data found in the response.")
-        
-        # Convert to pandas DataFrame
-        df = pd.DataFrame(hourly_list)
-        
-        # Parse the 'time' column to datetime if present
-        if 'time' in df.columns:
-            df['time'] = pd.to_datetime(df['time'], format='%Y%m%d:%H%M')
-        df.set_index('time', inplace=True)
-             
-        return df
-
-    
-    # Calculate production if user clicks the button
-    if st.button("Izračunaj proizvodnju SE"):
-        with st.spinner("Računam proizvodnju SE..."):
+    st.write("Satna proizvodnja iz PVGIS-a (EU JRC), pretvorena iz UTC-a u srednjoeuropsko vrijeme i raspodijeljena na 15-minutne intervale.")
+    pv_year = st.selectbox("Meteorološka godina (PVGIS)", list(range(2005, 2024)), index=2019 - 2005,
+                           help="2019. je godina čija je proizvodnja najbliža desetogodišnjem prosjeku izmjerenom na FESB-u.")
+    pv_params = (round(latitude, 4), round(longitude, 4), int(pv_year), float(system_capacity_kw), int(losses), int(tilt),
+                 int(azimuth), module_type, "free", TRACKING[tracking])
+    if st.button("Izračunaj proizvodnju SE", type="primary"):
+        with st.spinner("Dohvaćam podatke iz PVGIS-a..."):
             try:
-                # Get production data           
-                production_data = get_hourly_radiation(latitude, longitude, start_year=2019, end_year=2019, peakpower=system_capacity_kw, 
-                                                       loss=total_system_losses_percent,pvtechchoice=module_type, angle=tilt, aspect=azimuth,
-                                                       trackingtype=tracking_type_dict[tracking_type])
-
-                production_data = production_data.shift(1, fill_value=0)
-
-                #upsample to 15min intervals
-                start = production_data.index.min()
-                end = production_data.index.max() + pd.Timedelta(hours=1) - pd.Timedelta(minutes=15)
-                idx_15 = pd.date_range(start=start, end=end, freq="15min")                
-
-                out = production_data["P"].reindex(idx_15, method="ffill")
-                production_data = out.to_frame(name="P")
-                production_data["energy_kwh"] = production_data["P"] * 0.25   # kWh in each 15-min slot
-                
-                #production_data.to_csv('production_data15_filled.csv')  # Save for debugging
-
-                production_data['ac_power_kw'] = production_data["energy_kwh"]  / 1000  # Convert W to kW
-                production_data['P'] = production_data["P"]  / 1000  # Convert W to kW
-
-                # Store the data in session state for use in other tabs
-                st.session_state['production_data'] = production_data
-                
-                # Display summary statistics
-                total_annual_kwh = production_data['ac_power_kw'].sum()
-                avg_daily_kwh = total_annual_kwh / 365
-                peak_power_kw = production_data['P'].max()
-                capacity_factor = (total_annual_kwh / (system_capacity_kw * 8760)) * 100
-                specific_yield = total_annual_kwh / system_capacity_kw
-                              
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Ukupna godišnja proizvodnja", f"{total_annual_kwh:.2f} kWh")
-                col2.metric("Specifična proizvodnja", f"{specific_yield:.2f} kWh/kW") 
-                col2.metric("Faktor angažiranja solarne elektrane ", f"{capacity_factor:.2f} %")
-                col3.metric("Prosječna dnevna proizvodnja", f"{avg_daily_kwh:.2f} kWh")
-                col3.metric("Zabilježena vršna snaga", f"{peak_power_kw:.2f} kW")  
-                
-                st.write("Za detaljan prikaz podataka o proizvodnji i potrošnji energije ispunite potrebne podatke u kartici 'Potrošnja' ")               
-                           
+                raw = fetch_pvgis(*pv_params)
+                ss['production_data'] = pvgis_to_15min(raw)
+                ss['pv_params_used'] = pv_params
             except Exception as e:
-                st.error(f"Greška pri izračunu proizvodnje SE: {str(e)}")
-                st.error("Molim vas pregledajte ulazne parametre i pokušajte ponovno.")
-    else:
-        st.info("Kliknite na  'Izračunaj proizvodnju SE' kako bi generirali procjenu proizvodnje SE")
+                st.error(f"Greška pri izračunu proizvodnje SE: {e}")
 
-with tabs[2]:   
+    production_data = ss.get('production_data')
+    if production_data is None:
+        st.info("Kliknite na 'Izračunaj proizvodnju SE' kako biste dobili procjenu proizvodnje.")
+    else:
+        used = ss.get('pv_params_used', pv_params)
+        if used != pv_params:
+            st.warning("Parametri sustava su promijenjeni. Ponovno kliknite 'Izračunaj proizvodnju SE'.")
+        total = production_data['ac_power_kw'].sum()
+        cap = used[3]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Ukupna godišnja proizvodnja", f"{total:,.0f} kWh")
+        c1.metric("Meteorološka godina", f"{used[2]}")
+        c2.metric("Specifična proizvodnja", f"{total / cap:,.0f} kWh/kW")
+        c2.metric("Faktor iskorištenja", f"{100 * total / (cap * 8760):.1f} %")
+        c3.metric("Prosječna dnevna proizvodnja", f"{total / 365:.1f} kWh")
+        c3.metric("Vršna satna snaga", f"{production_data['P'].max():.2f} kW")
+        monthly = production_data['ac_power_kw'].groupby(INDEX_15.month).sum()
+        fig = px.bar(x=MONTH_ABBR, y=monthly.to_numpy(), labels={'x': 'Mjesec', 'y': 'Energija (kWh)'},
+                     title='Mjesečna proizvodnja', color_discrete_sequence=[COLOR['pv']])
+        fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=380)
+        show(fig)
+
+# --------------------------------------------------------------------------- 2 consumption
+consumption_df = None
+with tabs[2]:
     st.header("Potrošnja električne energije kućanstva")
-    st.write("Profil potrošnje energije; moguće je odabrati predefinirani profili ili unijeti vlastite podatke o potrošnji električne energije")
-
-    # Mode selector (radio buttons) to choose input method
-    input_mode = st.radio(
-        "Odaberite način unosa potrošnje:",
-        options=["Predefinirani profil", "Uploadirajte satne podatke"],
-        index=0,  # Default to predefined
-        key='input_mode_cons',
-        help="Predefinirani: unaprijed određeni profil ; Upload za podatke o vlastitoj potrošnji. Prebacivanje briše prethodne podatke")
-
-    if input_mode == "Predefinirani profil":
-        # Clear any upload state when switching to predefined
-        if 'consumption_file' in st.session_state:
-            del st.session_state['consumption_file']
-            st.rerun()  # Safe here, as it's in main script
-            st.success("Uploadirana datoteka uklonjena. Koristi se predefinirani profil.")
-        
-        st.info("Koristi se predefinirani profil potrošnje.")
-        
-        # Predefined inputs
-        annual_consumption = st.number_input("Godišnja potrošnja električne energije (kWh)", min_value=1000.0, max_value=100000.0, value=5595.4, step=100.0, key='annual_consumption')
-        
-        # Consumption pattern options
-        consumption_pattern = st.selectbox(
-            "Uzorak potrošnje energije", 
-            options=["Primjer kućanstva", "Jednoliko distribuirana", "Veća potrošnja tijekom dana", "Veća potrošnja tijekom večeri", "Sezonska (veća potrošnja ljeti)", "Sezonska (veća potrošnja zimi)"],
-            index=0,
-            key='consumption_pattern'
-        )
-        
-    elif input_mode == "Uploadirajte satne podatke":
-        # Clear any predefined changes? Not needed, as we use upload exclusively here
-        
-        st.write("Uploadirajte svoju 15-minutnu potrošnju električne energije u CSV ili Excel formatu.")        
-        st.write("Datoteka treba sadržavati vrijednosti 15-minutne potrošnje u  kWh za cijelu godinu (8760 sati * 4 = 35040 vrijednosti).")
-        
-        # File format explanation
-        with st.expander("Format datoteke treba ispunjavati uvjete:"):
+    mode = st.radio("Način unosa potrošnje:", ["Predefinirani profil", "Uploadirajte vlastite podatke"], horizontal=True)
+    load = None
+    if mode == "Predefinirani profil":
+        c1, c2 = st.columns(2)
+        pattern = c1.selectbox("Uzorak potrošnje energije", PATTERNS, index=0)
+        default_annual = float(np.round(pd.read_csv("Load_data_15min.csv", header=None)[0].sum(), 1))
+        annual = c2.number_input("Godišnja potrošnja električne energije (kWh)", min_value=500.0, max_value=100000.0,
+                                 value=default_annual, step=100.0)
+        load = predefined_profile(pattern, annual)
+    else:
+        with st.expander("Format datoteke"):
             st.markdown("""
-            ### Potrebni format datotekje:
-            - CSV ili Excel datoteka sa podacima o 15-minutnoj potrošnji
-            - Datoteka treba sadržavati 35040 podataka (jedna puna godina 15-minutnih iznosa potrošnje)
-            - Podaci trebaju biti unešeni u jedan stupac bez naslova
-            - Vrijednosti potrošnje trebaju biti u kWh
-            
-            ### Primjer:
-            ```
-            0.5
-            0.7
-            0.6
-            ...
-            ```
-            
-            ### Izborne opcije:
-            - Ako datoteka sadrži stupac sa datumom i vremenom, možete specificirati koji stupac sadrži vrijednosti potrošnje        
-            - Ako datoteka sadrži manje od 35040 podataka o potrošnji, podaci će se ponavljati dok se ne popuni čitava godina
-            """)
-        
-        # File uploader
-        uploaded_file = st.file_uploader("Izaberite datoteku", type=["csv", "xlsx", "xls"], key='consumption_file')
-        
-        # Manual clear button (for removing file without mode switch)
-        if uploaded_file is not None:
-            if st.button("Ukloni uploadiranu datoteku"):
-                if 'consumption_file' in st.session_state:
-                    del st.session_state['consumption_file']
-                st.rerun()
-                st.info("Datoteka uklonjena. Prebacite se na predefinirani profil za automatsko ažuriranje.")
-        
-        # Options for file processing (only show if file uploaded)
-        if uploaded_file is not None:
-            st.success("Datoteka uspješno uploadirana!")
-            
-            # File processing options
-            col1, col2 = st.columns(2)
-            with col1:
-                skip_rows = st.number_input("Preskoči redaka", min_value=0, value=0, help="Broj redaka naslova za preskočiti", key='skip_rows_cons')
-                has_header = st.checkbox("Datoteka sadrži naslov stupca", value=False, key='has_header_cons')
-            
-            with col2:
-                if has_header:
-                    column_name = st.text_input("Stupac sa podacima o potrošnji", value="potrošnja", 
-                                                help="Naslov stupca koji sadrži podatke o potrošnji", key='column_name_cons')
-                else:
-                    column_index = st.number_input("Broj stupca sa podacima o potrošnji", min_value=0, value=0,
-                                                help="Index stupca koji sadrži podatke o potrošnji (0 za prvi stupac)", key='column_index_cons')
-            
-            # Preview uploaded data
-            st.write("Pregled uploadiranih podataka:")
+- CSV ili Excel, jedan stupac s vrijednostima potrošnje (bez datuma ili uz odabir stupca)
+- **35.040** 15-minutnih vrijednosti ili **8.760** satnih vrijednosti za jednu godinu (prijestupna godina je dopuštena)
+- prva vrijednost odgovara intervalu 1. 1. 00:00 po srednjoeuropskom (zimskom) vremenu
+- vrijednosti u **kWh po intervalu** ili kao **prosječna snaga u kW**
+- ako je vrijednosti manje, ponavljaju se do pune godine
+""")
+        uploaded = st.file_uploader("Izaberite datoteku", type=["csv", "xlsx", "xls"])
+        if uploaded is not None:
+            c1, c2, c3 = st.columns(3)
+            skip = c1.number_input("Preskoči redaka", min_value=0, value=0)
+            has_header = c1.checkbox("Datoteka ima naslove stupaca", value=False)
+            column = c2.text_input("Naslov stupca", value="potrošnja") if has_header else c2.number_input("Broj stupca (0 = prvi)", min_value=0, value=0)
+            unit = c3.radio("Jedinica", ["kWh", "kW"], horizontal=True)
+            decimal = c3.radio("Decimalni separator", [".", ","], horizontal=True)
             try:
-                uploaded_file.seek(0)  # Reset position for preview
-                if uploaded_file.name.endswith('.csv'):
-                    preview_df = pd.read_csv(uploaded_file, nrows=5, decimal='.')
-                else:  # Excel file
-                    preview_df = pd.read_excel(uploaded_file, nrows=5)
-                
-                st.dataframe(preview_df)
-                uploaded_file.seek(0)  # Reset for future reads
-                
+                load, notes = read_upload(uploaded.getvalue(), uploaded.name, int(skip), has_header, column, unit, decimal)
+                for n in notes:
+                    st.info(n)
             except Exception as e:
-                st.error(f"Greška kod pregleda datoteke: {str(e)}")
-                st.error("Molimo provjerite format datoteke i pokušajte ponovno.")
+                st.error(f"Greška u obradi datoteke: {e}")
+        else:
+            st.info("Uploadirajte datoteku s podacima o potrošnji.")
 
-    # Reactive computation (runs on every rerun if production data exists)
-    if 'production_data' not in st.session_state:
-        st.warning("Molim izračunajte proizvodnju SE u kartici Proizvodnja.")
-        st.session_state['consumption_data'] = None
-    else:
-        input_mode = st.session_state.get('input_mode_cons', 'Predefinirani profil')  # Get from session state
-        uploaded_file = None if input_mode == "Predefinirani profil" else st.session_state.get('consumption_file')
-        use_predefined_pattern = (input_mode == "Predefinirani profil" or uploaded_file is None)
-  
-    if 'production_data' in st.session_state and st.session_state['consumption_data'] is None:
-        with st.spinner("Računam potrošnju..."):
-            try:
-                # Get production data from session state
-                prod_copy = st.session_state['production_data'].copy()
-                
-                # Generate hourly consumption profile based on input method
-                values_in_year = 35040
-                hourly_consumption = np.zeros(values_in_year)
-                
-                # Check if user uploaded consumption data (current state)
-                uploaded_file = st.session_state.get('consumption_file')
-                use_predefined_pattern = uploaded_file is None
-                
-                if not use_predefined_pattern:
-                    try:
-                        # Get file processing params from session state (via keys)
-                        skip_rows = st.session_state.get('skip_rows_cons', 0)
-                        has_header = st.session_state.get('has_header_cons', False)
-                        column_name = st.session_state.get('column_name_cons', 'potrošnja') if has_header else None
-                        column_index = st.session_state.get('column_index_cons', 0) if not has_header else None
-                        
-                        # Reset file position and read the file
-                        uploaded_file.seek(0)
-                        if uploaded_file.name.endswith('.csv'):
-                            if has_header:
-                                consumption_df_raw = pd.read_csv(uploaded_file, skiprows=skip_rows, decimal='.')
-                                consumption_values = consumption_df_raw[column_name].values
-                            else:
-                                consumption_df_raw = pd.read_csv(uploaded_file, header=None, skiprows=skip_rows, decimal='.')
-                                consumption_values = consumption_df_raw.iloc[:, column_index].values
-                        else:  # Excel file
-                            if has_header:
-                                consumption_df_raw = pd.read_excel(uploaded_file, skiprows=skip_rows)
-                                consumption_values = consumption_df_raw[column_name].values
-                            else:
-                                consumption_df_raw = pd.read_excel(uploaded_file, header=None, skiprows=skip_rows)
-                                consumption_values = consumption_df_raw.iloc[:, column_index].values
-                        
-                        # Handle case where uploaded data doesn't have exactly 35040 values
-                        if len(consumption_values) < values_in_year:
-                            # Repeat the data to fill a full year
-                            repetitions = int(np.ceil(values_in_year / len(consumption_values)))
-                            consumption_values = np.tile(consumption_values, repetitions)[:values_in_year]
-                            st.info(f"Uploaded data had {len(consumption_values)} values, repeated to fill 35040 values.")
-                        elif len(consumption_values) > values_in_year:
-                            # Truncate to 35040 values
-                            consumption_values = consumption_values[:values_in_year]
-                            st.info(f"Uploaded data had more than 35040 values, truncated to first 35040 values .")
-                        
-                        # Use the uploaded consumption values
-                        hourly_consumption = consumption_values
-                        
-                        # Calculate actual annual consumption from uploaded data
-                        actual_annual_consumption = hourly_consumption.sum()
-                        
-                    except Exception as e:
-                        st.error(f"Greška u obradi uploadiranih podataka o potrošnji: {str(e)}")
-                        st.error("Korišten je predefinirani uzorak potrošnje.")
-                        use_predefined_pattern = True
-                else:
-                    # No uploaded file, use predefined patterns
-                    annual_consumption = st.session_state.get('annual_consumption', 5595.4)
-                    consumption_pattern = st.session_state.get('consumption_pattern', 'Jednoliko distribuirana')
-                
-                # Use predefined patterns if no upload or if there was an error
-                if use_predefined_pattern:
-                    if consumption_pattern == "Primjer kućanstva":
-                        hourly_consumption = pd.read_csv("Load_data_15min.csv", header=None).values.flatten()
+    if load is not None:
+        consumption_df = pd.DataFrame({'consumption_kw': load}, index=INDEX_15)   # kWh per 15 min
+        total_load = load.sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Ukupna godišnja potrošnja", f"{total_load:,.0f} kWh")
+        c2.metric("Prosječna dnevna potrošnja", f"{total_load / 365:.1f} kWh")
+        c3.metric("Vršna 15-minutna snaga", f"{load.max() * 4:.2f} kW")
+        if production_data is not None:
+            pv = production_data['ac_power_kw'].to_numpy()
+            self_cons = np.minimum(pv, load).sum()
+            c1.metric("Udio vlastite potrošnje proizvodnje", f"{100 * self_cons / pv.sum():.1f} %")
+            c2.metric("Pokrivenost potrošnje iz SE", f"{100 * self_cons / total_load:.1f} %")
 
-                    elif consumption_pattern == "Jednoliko distribuirana":
-                        hourly_consumption = np.ones(values_in_year) * (annual_consumption / values_in_year)
-                    
-                    elif consumption_pattern == "Veća potrošnja tijekom dana":
-                        # More consumption during daytime (8am-6pm)
-                        for i in range(values_in_year):
-                            #hour = i % 24
-                            hour=prod_copy.index[i].hour
-                            if 8 <= hour < 18:  # Daytime hours
-                                hourly_consumption[i] = 1.5
-                            else:
-                                hourly_consumption[i] = 0.5
-                        # Normalize to match annual consumption
-                        hourly_consumption = hourly_consumption * (annual_consumption / hourly_consumption.sum())
-                    
-                    elif consumption_pattern == "Veća potrošnja tijekom večeri":
-                        # More consumption during evening (5pm-11pm)
-                        for i in range(values_in_year):
-                            hour=prod_copy.index[i].hour
-                            if 17 <= hour < 23:  # Evening hours
-                                hourly_consumption[i] = 2.0
-                            else:
-                                hourly_consumption[i] = 0.5
-                        # Normalize to match annual consumption
-                        hourly_consumption = hourly_consumption * (annual_consumption / hourly_consumption.sum())
-                    
-                    elif consumption_pattern == "Sezonska (veća potrošnja ljeti)":
-                        # More consumption in summer months (May-Sep)
-                        for i in range(values_in_year):
-                            month = prod_copy.index[i].month
-                            if 5 <= month <= 9:  # Summer months
-                                hourly_consumption[i] = 1.5
-                            else:
-                                hourly_consumption[i] = 0.5
-                        # Normalize to match annual consumption
-                        hourly_consumption = hourly_consumption * (annual_consumption / hourly_consumption.sum())
-                    
-                    elif consumption_pattern == "Sezonska (veća potrošnja zimi)":
-                        # More consumption in winter months (Nov-Mar)
-                        for i in range(values_in_year):
-                            month = prod_copy.index[i].month
-                            if month <= 3 or month >= 11:  # Winter months
-                                hourly_consumption[i] = 1.5
-                            else:
-                                hourly_consumption[i] = 0.5
-                        # Normalize to match annual consumption
-                        hourly_consumption = hourly_consumption * (annual_consumption / hourly_consumption.sum())
-                
-                # Create DataFrame with consumption data
-                consumption_df = pd.DataFrame({
-                    'consumption_kw': hourly_consumption
-                }, index=prod_copy.index)
-                
-                # Store actual annual consumption for reporting
-                actual_annual_consumption = consumption_df['consumption_kw'].sum()
-                
-                # Combine production and consumption data
-                energy_balance = pd.DataFrame({
-                    'production_kw': prod_copy['ac_power_kw'],
-                    'consumption_kw': consumption_df['consumption_kw']
-                })
-                
-                # Calculate net energy (positive = excess, negative = deficit)
-                energy_balance['net_kw'] = energy_balance['production_kw'] - energy_balance['consumption_kw']
-                
-                # Calculate self-consumption and grid export/import
-                energy_balance['self_consumed_kw'] = np.minimum(energy_balance['production_kw'], energy_balance['consumption_kw'])
-                energy_balance['exported_kw'] = np.maximum(0, energy_balance['net_kw'])
-                energy_balance['imported_kw'] = np.maximum(0, -energy_balance['net_kw'])
-                
-                # Pre-calculate metrics for display
-                total_annual_load_kWh = consumption_df['consumption_kw'].sum()
-                avg_daily_load_kwh = total_annual_load_kWh / 365
-                peak_power_load_kw = consumption_df['consumption_kw'].max()*4
-                
-                total_annual_kwh = prod_copy['ac_power_kw'].sum()
-                avg_daily_kwh = total_annual_kwh / 365
-                peak_power_kw = prod_copy['ac_power_kw'].max()*4
-                
-                # Store computed data in session state for display (overwrites on each update)
-                st.session_state['consumption_data'] = {
-                    'consumption_df': consumption_df,
-                    'energy_balance': energy_balance,
-                    'total_annual_load_kWh': total_annual_load_kWh,
-                    'avg_daily_load_kwh': avg_daily_load_kwh,
-                    'peak_power_load_kw': peak_power_load_kw,
-                    'total_annual_kwh': total_annual_kwh,
-                    'avg_daily_kwh': avg_daily_kwh,
-                    'peak_power_kw': peak_power_kw
-                }
-                
-                st.success("Podaci o potrošnji ažurirani!")
+        month_idx = INDEX_15.month
+        df_m = pd.DataFrame({'Mjesec': MONTH_ABBR, 'Potrošnja': pd.Series(load).groupby(month_idx).sum().to_numpy()})
+        if production_data is not None:
+            df_m['Proizvodnja'] = production_data['ac_power_kw'].groupby(month_idx).sum().to_numpy()
+        df_long = df_m.melt(id_vars='Mjesec', var_name='Vrsta', value_name='Energija (kWh)')
+        fig = px.bar(df_long, x='Mjesec', y='Energija (kWh)', color='Vrsta', barmode='group',
+                     title='Mjesečna proizvodnja i potrošnja',
+                     color_discrete_map={'Proizvodnja': COLOR['pv'], 'Potrošnja': COLOR['load']})
+        fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=420)
+        show(fig)
 
-                #consumption_df.to_csv('consumption_df.csv')
-                
-            except Exception as e:
-                st.error(f"Greška pri obradi podataka: {str(e)}")
-                st.error("Molim pregledajte ulazne podatke i pokušajte ponovno.")
-                st.session_state['consumption_data'] = None
+        def heatmap(values, title):
+            pivot = pd.Series(values * 4).groupby([INDEX_15.hour, INDEX_15.month]).mean().unstack()
+            f = px.imshow(pivot, labels=dict(x="Mjesec", y="Sat", color="Prosj. snaga (kW)"),
+                          x=MONTH_ABBR, y=[f"{h}:00" for h in range(24)], color_continuous_scale='YlOrRd',
+                          title=title, aspect='auto')
+            f.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=450)
+            show(f)
 
+        heatmap(load, "Prosječna potrošnja po satu i mjesecu")
+        if production_data is not None:
+            heatmap(production_data['ac_power_kw'].to_numpy(), "Prosječna proizvodnja po satu i mjesecu")
 
-    # Display section (renders if computed data exists, updates reactively)
-    if st.session_state.get('consumption_data') is not None:
-        data = st.session_state['consumption_data']              
-        consumption_df=st.session_state['consumption_data']['consumption_df']
+        st.subheader("Prosječni dnevni profil")
+        sel = st.selectbox("Mjesec", range(1, 13), format_func=lambda x: MONTHS[x - 1], index=6)
+        mm = INDEX_15.month == sel
+        prof = pd.DataFrame({'Potrošnja': pd.Series(load[mm] * 4).groupby(INDEX_15[mm].hour).mean()})
+        if production_data is not None:
+            prof['Proizvodnja'] = pd.Series(production_data['ac_power_kw'].to_numpy()[mm] * 4).groupby(INDEX_15[mm].hour).mean()
+        fig = px.line(prof, markers=True, labels={'index': 'Sat', 'value': 'Prosječna snaga (kW)', 'variable': ''},
+                      title=f'Prosječni dnevni profil – {MONTHS[sel - 1]}',
+                      color_discrete_map={'Proizvodnja': COLOR['pv'], 'Potrošnja': COLOR['load']})
+        fig.update_layout(xaxis=dict(tickmode='linear', dtick=2), margin=dict(l=10, r=10, t=40, b=10), height=380)
+        show(fig)
 
-        def calculate_self_consumption_metrics(production_df, consumption_df):
-            # Align indices (both should be 8760 hourly)
-            common_index = production_df.index.intersection(consumption_df.index)
-            pv_hourly = production_df.loc[common_index, 'ac_power_kw'].fillna(0)
-            load_hourly = consumption_df.loc[common_index, 'consumption_kw'].fillna(0)
-            
-            # Self-consumed = min(PV, load) for each hour
-            self_consumed_hourly = np.minimum(pv_hourly, load_hourly)
-            
-            # Annual totals
-            annual_pv = pv_hourly.sum()
-            annual_load = load_hourly.sum()
-            annual_self_consumed = self_consumed_hourly.sum()
-            
-            # Ratios (avoid division by zero)
-            self_consumption_ratio = (annual_self_consumed / annual_pv * 100) if annual_pv > 0 else 0
-            self_sufficiency_ratio = (annual_self_consumed / annual_load * 100) if annual_load > 0 else 0
-            
-            return {
-                'annual_pv_kwh': annual_pv,
-                'annual_load_kwh': annual_load,
-                'annual_self_consumed_kwh': annual_self_consumed,
-                'self_consumption_pct': round(self_consumption_ratio, 1),
-                'self_sufficiency_pct': round(self_sufficiency_ratio, 1)            }
+ready = production_data is not None and consumption_df is not None
 
-        metrics = calculate_self_consumption_metrics( prod_copy, consumption_df)        
-        
-        # Display summary statistics
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Ukupna godišnja potrošnja", f"{data['total_annual_load_kWh']:.2f} kWh")
-        col2.metric("Prosječna dnevna potrošnja", f"{data['avg_daily_load_kwh']:.2f} kWh")
-        col3.metric("Zabilježena vršna potrošnja", f"{data['peak_power_load_kw']:.2f} kW")
-        
-        col1.metric("Ukupna godišnja proizvodnja", f"{data['total_annual_kwh']:.2f} kWh")
-        col2.metric("Prosječna dnevna proizvodnja", f"{data['avg_daily_kwh']:.2f} kWh")
-        col3.metric("Zabilježena vršna proizvodnja", f"{data['peak_power_kw']:.2f} kW")    
-
-        col1.metric("Stopa samopotrošnje", f"{metrics['self_consumption_pct']}%")
-        
-        # Create monthly production chart
-        monthly_production = prod_copy.resample('ME')['ac_power_kw'].sum()
-        monthly_production.index = monthly_production.index.strftime('%b')
-        monthly_load = data['consumption_df'].resample('ME')['consumption_kw'].sum()
-        monthly_load.index = monthly_load.index.strftime('%b')
-        
-        # Combine into a DataFrame
-        df_combined = pd.DataFrame({
-            'Mjesec': monthly_production.index,
-            'Proizvodnja': monthly_production.values,
-            'Potrošnja': monthly_load.values
-        })
-
-        # Melt to long format for grouped bars
-        df_long = df_combined.melt(id_vars='Mjesec', value_vars=['Proizvodnja', 'Potrošnja'],
-                                var_name='Vrsta', value_name='Energija (kWh)')
-
-        # Create grouped bar chart
-        fig = px.bar(
-            df_long,
-            x='Mjesec',
-            y='Energija (kWh)',
-            color='Vrsta',
-            barmode='group',  # Side-by-side bars
-            labels={'Mjesec': 'Mjesec', 'Energija (kWh)': 'Energija (kWh)'},
-            title='Mjesečna proizvodnja i potrošnja energije',
-            color_discrete_sequence=['#FFA500', '#1f77b4']  # Orange for production, blue for load
-        )
-        fig.update_layout(
-            autosize=True,
-            margin=dict(l=10, r=10, t=30, b=10),
-            height=350 if st.session_state.get('_is_mobile', False) else 500
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Create hourly heatmap for daily consumption patterns
-        hourly_data = data['consumption_df'].copy()*4
-        hourly_data['hour'] = data['consumption_df'].index.hour
-        hourly_data['month'] = data['consumption_df'].index.month
-        
-        # Pivot the data to create a month vs hour heatmap
-        pivot_data = hourly_data.pivot_table(
-            index='hour', 
-            columns='month', 
-            values='consumption_kw', 
-            aggfunc='mean'
-        )
-        
-        # Create heatmap
-        fig = px.imshow(
-            pivot_data,
-            labels=dict(x="Mjesec", y="Sat u danu", color="Prosječna snaga (kW)"),
-            x=[f"{m}" for m in range(1, 13)],
-            y=[f"{h}:00" for h in range(24)],
-            color_continuous_scale='YlOrRd',
-            title="Prosječna satna potrošnja po mjesecima"
-        )
-        fig.update_layout(
-            autosize=True,
-            margin=dict(l=10, r=10, t=30, b=10),
-            height=350 if st.session_state.get('_is_mobile', False) else 500
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Create hourly heatmap for daily production patterns
-        hourly_data = prod_copy.copy()*4
-        hourly_data['hour'] = prod_copy.index.hour
-        hourly_data['month'] = prod_copy.index.month
-        
-        # Pivot the data to create a month vs hour heatmap
-        pivot_data = hourly_data.pivot_table(
-            index='hour', 
-            columns='month', 
-            values='ac_power_kw', 
-            aggfunc='mean'
-        )
-        
-        # Create heatmap
-        fig = px.imshow(
-            pivot_data,
-            labels=dict(x="Mjesec", y="Sat u danu", color="Prosječna snaga (kW)"),
-            x=[f"{m}" for m in range(1, 13)],
-            y=[f"{h}:00" for h in range(24)],
-            color_continuous_scale='YlOrRd',
-            title="Prosječna satna proizvodnja po mjesecima"
-        )
-        fig.update_layout(
-            autosize=True,
-            margin=dict(l=10, r=10, t=30, b=10),
-            height=350 if st.session_state.get('_is_mobile', False) else 500
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Show daily production for a sample month
-        st.subheader("Dnevni profil proizvodnje i potrošnje")
-        sample_month = st.selectbox("Odaberite mjesec za prikaz dnevnog profila:", 
-                                    options=range(1, 13), 
-                                    format_func=lambda x: datetime(2000, x, 1).strftime('%B'),
-                                    index=6, key='sample_month_cons')  # Default to July, with key for state
-        
-        # Filter data for selected month
-        month_data = prod_copy[prod_copy.index.month == sample_month]*4
-        month_load_data = data['consumption_df'][data['consumption_df'].index.month == sample_month]*4
-        
-        # Group by hour of day
-        hourly_avg = month_data.groupby(month_data.index.hour)['ac_power_kw'].mean()
-        hourly_avg_load = month_load_data.groupby(month_load_data.index.hour)['consumption_kw'].mean()
-        
-        # Combine into a DataFrame (index is hours)
-        df_comb = pd.DataFrame({
-            'Proizvodnja': hourly_avg,
-            'Potrošnja': hourly_avg_load
-        })
-        
-        # Create line chart with both lines
-        fig = px.line(
-            df_comb,
-            y=['Proizvodnja', 'Potrošnja'],  # Plot multiple y columns
-            labels={'index': 'Sat', 'value': 'Prosječna snaga (kW)'},
-            title=f'Prosječni dnevni profil proizvodnje i potrošnje za {datetime(2000, sample_month, 1).strftime("%B")}',
-            markers=True,
-            color_discrete_sequence=['#FFA500', '#1f77b4']  # Orange for production, blue for consumption
-        )     
-        fig.update_layout(xaxis=dict(tickmode='linear', tick0=0, dtick=2))
-        st.plotly_chart(fig, use_container_width=True)     
-        
-    else:
-        st.info("Kliknite na karticu Proizvodnja da biste izračunali proizvodnju, zatim izmijenite podatke o potrošnji za automatsko ažuriranje.")
-
+# --------------------------------------------------------------------------- 3 annual bill
+settlement = None
 with tabs[3]:
     st.header("Godišnji račun")
-    st.write("Izračun godišnjeg troška za električnu energiju")
-    
-    # Financial inputs section
-    st.subheader("Parametri")
-    col1, col2 = st.columns(1) if st.session_state.get('_is_mobile', False) else st.columns(2)
+    c1, c2, c3 = st.columns(3)
+    tariff = c1.selectbox("Tarifni model", TARIFFS, index=0)
+    customer = c2.selectbox("Kategorija kupca (neto obračun)", list(CUSTOMER), index=0)
+    is_business = customer.startswith("Poduzetništvo")
+    k_export = c2.number_input("Faktor cijene predane energije (kSO)", min_value=0.0, max_value=1.0,
+                               value=CUSTOMER[customer], step=0.05, key=f"k_{customer}", disabled=is_business,
+                               help="HERA: 1 za kućanstva (Poticajni okvir, 16. 7. 2026.). Za poduzetništvo zakon propisuje 0,9.")
+    sub_kwh = c3.number_input("Prag šestomjesečne potrošnje (kWh)", min_value=0, max_value=100000, value=3000, step=100,
+                              help="Iznad praga cijena energije je viša za postotak iz cjenika (Sub_increase).")
+    if is_business:
+        k_export = eb.FACTOR_BUSINESS
 
-    with col1:
-        # Electricity rates
-         tariff = st.selectbox("Tarifni model", options=[ "Bijeli (VT_NT)","Plavi (JT)", "Crveni (VT_NT)", "Crni (JT)" ], index=0)
-         
-    if st.button("Izračunaj godišnji trošak za električnu energiju"):
+    if not ready:
+        st.warning("Izračunajte proizvodnju SE (kartica Proizvodnja) i odaberite potrošnju (kartica Potrošnja).")
+    else:
+        prices_df, settlement = run_settlement(production_data['ac_power_kw'].to_numpy(), consumption_df['consumption_kw'].to_numpy(),
+                                               tariff, float(k_export), int(sub_kwh))
+        totals = {s: settlement[s][2].loc['Year', 'Bill'] for s in ('noPV', 'month', '15min')}
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Bez SE", f"{totals['noPV']:,.2f} EUR")
+        c2.metric(LABEL['month'], f"{totals['month']:,.2f} EUR", delta=f"{totals['month'] - totals['noPV']:,.2f} EUR", delta_color="inverse")
+        c3.metric(LABEL['15min'], f"{totals['15min']:,.2f} EUR", delta=f"{totals['15min'] - totals['noPV']:,.2f} EUR", delta_color="inverse")
 
-        with st.spinner("Računam godišnji trošak za električnu energiju..."):
+        df_b = pd.DataFrame({'Mjesec': MONTH_ABBR})
+        for s in ('noPV', 'month', '15min'):
+            df_b[LABEL[s]] = [settlement[s][1][mj].loc[9, 'Iznos EUR'] for mj in MONTHS]
+        fig = px.bar(df_b.melt(id_vars='Mjesec', var_name='Obračun', value_name='EUR'), x='Mjesec', y='EUR', color='Obračun',
+                     barmode='group', title='Mjesečni računi za električnu energiju',
+                     color_discrete_map={LABEL[s]: COLOR[s] for s in LABEL})
+        fig.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=420)
+        show(fig)
 
-            production_data = st.session_state['production_data']
-            consumption_df=st.session_state['consumption_data']['consumption_df']
-            no_pv_df=production_data.copy()
-            no_pv_df['ac_power_kw']=0
-            prices_csv=f'{tariff}.csv'
-            prices_df=pd.read_csv(prices_csv,index_col=None) 
-            
-            st.session_state['prices_df']=prices_df
+        c1, c2 = st.columns(2)
+        for col, s in ((c1, 'month'), (c2, '15min')):
+            with col:
+                st.write(f"**Godišnji račun – {LABEL[s]}**")
+                g = settlement[s][3]
+                show(eb.plot_bill_style_plotly(g[g.index < 10]))
+                st.download_button("Preuzmi godišnji račun (CSV)", g.to_csv().encode('utf-8'),
+                                   f"godisnji_racun_{s}.csv", "text/csv", key=f"dl_{s}")
 
-            obracun_energije_month, racuni_month, bilanca_month, godišnji_month = izvrši_obracun(production_data,consumption_df,prices_df,net_interval='month')
-            obracun_energije_15min, racuni_15min, bilanca_15min,godišnji_15min = izvrši_obracun(production_data,consumption_df,prices_df,net_interval='15min')
-            obracun_energije_noPV, racuni_noPV, bilanca_noPV,godišnji_noPV = izvrši_obracun(no_pv_df,consumption_df,prices_df)
+        st.subheader("Mjesečni računi")
+        mj = st.selectbox("Mjesec računa", MONTHS, index=6)
+        c1, c2 = st.columns(2)
+        for col, s in ((c1, 'month'), (c2, '15min')):
+            with col:
+                st.write(f"**{mj} – {LABEL[s]}**")
+                show_bill(settlement[s][1][mj])
 
-            st.session_state['racuni_month']=racuni_month
-            st.session_state['racuni_15min']=racuni_15min   
-            st.session_state['racuni_noPV']=racuni_noPV
-
-            month_names = ['Siječanj', 'Veljača', 'Ožujak', 'Travanj', 'Svibanj', 'Lipanj',
-                        'Srpanj', 'Kolovoz', 'Rujan', 'Listopad', 'Studeni', 'Prosinac']
-            
-            bills_month = [racuni_month[month].loc[9, 'Iznos EUR'] for month in month_names]
-            bills_15min = [racuni_15min[month].loc[9, 'Iznos EUR'] for month in month_names]
-            bills_noPV = [racuni_noPV[month].loc[9, 'Iznos EUR'] for month in month_names]
-
-            total_month = bilanca_month.loc['Year', 'Bill']
-            total_15min = bilanca_15min.loc['Year', 'Bill']
-            total_noPV = bilanca_noPV.loc['Year', 'Bill']
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Ukupan godišnji trošak - mjesečno netiranje", f"{total_month:.2f} EUR")
-            col2.metric("15min netiranje", f"{total_15min:.2f} EUR")
-            col3.metric("Bez solarne elektrane", f"{total_noPV:.2f} EUR") 
-
-            st.download_button("Preuzmi godišnji račun (CSV)", godišnji_month.to_csv(), "godisnji_racun.csv")         
-      
-            # Combine into a DataFrame 
-            df_3 = pd.DataFrame({
-                'Mjesec': month_names,
-                'Bez SE': bills_noPV, 
-                'Mjesečno netiranje': bills_month, 
-                '15min netiranje': bills_15min,                            
-            })
-                           
-            # Melt to long format for grouped bars
-            df_long = df_3.melt(id_vars='Mjesec', value_vars=['Bez SE','Mjesečno netiranje', '15min netiranje'],
-                                    var_name='Vrsta', value_name='EUR')
-
-            # Create grouped bar chart
-            fig = px.bar(
-                df_long,
-                x='Mjesec',
-                y='EUR',
-                color='Vrsta',
-                barmode='group',  # Side-by-side bars
-                labels={'Mjesec': 'Mjesec', 'Energija (kWh)': 'Energija (kWh)'},
-                title='Iznos mjesečnih računa za električnu energiju',
-                color_discrete_sequence=["#a3a3a3", "#ffea30","#f79729"]  # Colors
-            )
-            fig.update_layout(
-                autosize=True,
-                margin=dict(l=10, r=10, t=30, b=10),
-                height=350 if st.session_state.get('_is_mobile', False) else 500
-            )
-            st.plotly_chart(fig, use_container_width=True)   
-                  
-            fig_bill = plot_bill_style_plotly(godišnji_month[godišnji_month.index<10])                       
-            fig_bill2 = plot_bill_style_plotly(godišnji_15min[godišnji_15min.index<10])
- 
-        col1, col2 = st.columns([1, 1])
-        with col1: 
-            st.write("Godišnji račun - mjesečno netiranje")
-            display_bill_table(fig_bill,godišnji_month[godišnji_month.index<10])
-
-        with col2: 
-            st.write("Godišnji račun - 15min netiranje")
-            display_bill_table(fig_bill2,godišnji_month[godišnji_month.index<10])
-    
-    if st.button("Prikaži mjesečne račune za električnu energiju"):  
-        racuni_month=st.session_state['racuni_month']
-        racuni_15min=st.session_state['racuni_15min']       
-
-        with st.spinner("Pripremam mjesečne račune ..."):
-            col1, col2 = st.columns([1, 1])
-            month_names = ['Siječanj', 'Veljača', 'Ožujak', 'Travanj', 'Svibanj', 'Lipanj',
-               'Srpanj', 'Kolovoz', 'Rujan', 'Listopad', 'Studeni', 'Prosinac']
-            with col1:
-                st.write("Mjesečni računi - mjesečno netiranje")
-                for month in month_names:
-                    st.markdown(f"""
-                        <div style='text-align: center; font-size:20; font-family: Arial; font-weight: bold; color: blue;'>
-                        {month}
-                        </div>
-                        """, unsafe_allow_html=True)
-                     
-                    racun=racuni_month[month]
-                    fig1 = plot_bill_style(racun[racun.index<10])
-                    fig2 = plot_bill_style2(racun[(racun.index > 10) & (racun.index < 16)])
-                    fig3 = plot_bill_style3(racun[racun.index>15])
-                    st.pyplot(fig1)
-                    st.pyplot(fig2)
-                    st.pyplot(fig3)
-
-            with col2:
-                st.write("Mjesečni računi - 15min netiranje")
-                for month in month_names:
-                    st.markdown(f"""
-                        <div style='text-align: center; font-size:20; font-family: Arial; font-weight: bold; color: blue;'>
-                        {month}
-                        </div>
-                        """, unsafe_allow_html=True)
-                    
-                    racun=racuni_15min[month]
-                    fig1 = plot_bill_style(racun[racun.index<10])
-                    fig2 = plot_bill_style2(racun[(racun.index > 10) & (racun.index < 16)])
-                    fig3 = plot_bill_style3(racun[racun.index>15])
-                    st.pyplot(fig1)
-                    st.pyplot(fig2)
-                    st.pyplot(fig3) 
-
+# --------------------------------------------------------------------------- 4 financial analysis
 with tabs[4]:
     st.header("Financijska analiza")
-    st.write("Analiza isplativosti ulaganja u solarnu elektranu kod mjesečno i 15minutnog netiranja energije")
+    st.write("Isplativost ulaganja kod mjesečnog netiranja i neto obračuna. "
+             "Mjesečno netiranje pretpostavljeno je kroz cijeli vijek trajanja elektrane.")
+    c1, c2 = st.columns(2)
+    with c1:
+        cost_per_kw = st.number_input("Trošak izgradnje solarne elektrane (€/kW)", min_value=300, max_value=5000, value=1000, step=10)
+        incentive = st.slider("Dobiveni poticaji (% troška izgradnje)", 0, 100, 0, 5)
+        loan_pct = st.slider("Udio financiranja kreditom (%)", 0, 100, 0, 5)
+        loan_rate = st.slider("Kamatna stopa kredita (%)", 0.0, 10.0, 3.0, 0.1)
+        loan_years = st.slider("Rok otplate kredita (godine)", 1, 25, 10, 1)
+        discount = st.slider("Diskontna stopa (%)", 0.0, 10.0, 4.0, 0.1)
+    with c2:
+        inverter_cost = st.number_input("Trošak zamjene invertera (€)", min_value=0.0, max_value=5000.0, value=500.0, step=10.0)
+        inverter_year = st.slider("Godina zamjene invertera", 1, 25, 10, 1)
+        lifetime = st.slider("Vijek trajanja sustava (godine)", 10, 30, 25, 1)
+        degradation = st.slider("Godišnja degradacija panela (%)", 0.0, 2.0, 0.8, 0.1)
+        om = st.slider("Održavanje i osiguranje (% troška izgradnje godišnje)", 0.0, 5.0, 0.5, 0.1)
+        growth = st.slider("Godišnji rast cijena električne energije (%)", 0.0, 10.0, 2.0, 0.5)
+        inflation = st.slider("Godišnja stopa inflacije (%)", 0.0, 10.0, 2.0, 0.5)
 
-    # Financial inputs section
-    st.subheader("Financijski parametri")
-    col1, col2 = st.columns(1) if st.session_state.get('_is_mobile', False) else st.columns(2)
-    
-    with col1:       
-        system_cost_per_kw = st.number_input("Trošak izgradnje solarne elektrane (€/kW)", min_value=500, max_value=5000, value=1000, step=10) 
-        system_cost_per_watt = system_cost_per_kw / 1000  # Convert to €/W
-        
-        incentive_percent = st.slider("Dobiveni poticaji (% od ukupnog troška)", min_value=0, max_value=100, value=0, step=5) 
-        loan_percent = st.slider("Postotak financiranja putem kredita (%)", min_value=0, max_value=100, value=0, step=5)
-        loan_interest_rate = st.slider("Kamatna stopa kredita (%)", min_value=0.0, max_value=10.0, value=3.0, step=0.1)
-        loan_term_years = st.slider("Rok otplate kredita (godine)", min_value=1, max_value=25, value=10, step=1)
-        discount_rate = st.slider("Diskontna stopa (%)", min_value=0.0, max_value=10.0, value=4.0, step=0.1)
-        
-    with col2:   
-        inverter_replacement_cost = st.number_input("Trošak zamjene invertera (€)", min_value=100.0, max_value=5000.0, value=500.0, step=10.0)
-        system_lifetime_years = st.slider("Vijek trajanja sustava (godine)", min_value=10, max_value=25, value=25, step=1)
-        degradation_rate = st.slider("Godišnja stopa degradacije panela (%)", min_value=0.0, max_value=5.0, value=0.8, step=0.1)      
-        maintenance_cost_percent = st.slider("Troškovi održavanja i osiguranja (% troška izgradnje SE)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)               
-        annual_rate_increase = st.slider("Godišnja stopa rasta cijene el. energije (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
-        inflation_rate = st.slider("Godišnja stopa inflacije (%)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
-    
-    if st.button("Izvrši financijsku analizu"):
+    if not ready:
+        st.warning("Izračunajte proizvodnju SE i odaberite potrošnju.")
+    else:
+        t0 = time.time()
+        params = dict(cost_per_kw=float(cost_per_kw), incentive_pct=float(incentive), loan_pct=float(loan_pct),
+                      loan_rate_pct=float(loan_rate), loan_years=int(loan_years), discount_pct=float(discount),
+                      inverter_cost=float(inverter_cost), inverter_year=int(inverter_year), lifetime=int(lifetime),
+                      degradation_pct=float(degradation), om_pct=float(om), price_growth_pct=float(growth),
+                      inflation_pct=float(inflation))
+        res = run_finance(production_data['ac_power_kw'].to_numpy(), consumption_df['consumption_kw'].to_numpy(),
+                          tariff, float(k_export), int(sub_kwh), float(ss.get('pv_params_used', pv_params)[3]), params)
+        costs = res['costs']
+        st.subheader("Financijski pokazatelji")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Ukupni trošak SE", f"€{costs['total']:,.0f}")
+        c1.metric("Trošak nakon poticaja", f"€{costs['net']:,.0f}")
+        c1.metric("Vlastita sredstva", f"€{costs['equity']:,.0f}")
+        if costs['loan'] > 0:
+            c1.metric("Godišnja rata kredita", f"€{costs['loan_payment']:,.0f}")
+        for col, s in ((c2, 'month'), (c3, '15min')):
+            r = res[s]
+            col.write(f"**{LABEL[s]}**")
+            col.metric("Ušteda na računu (1. godina)", f"€{r['first_year_saving']:,.0f}")
+            col.metric("Diskontirani povrat ulaganja", years_text(r['payback']))
+            col.metric("Neto sadašnja vrijednost (NPV)", f"€{r['npv']:,.0f}")
+            col.metric("Interna stopa povrata (IRR)", f"{100 * r['irr']:.1f} %" if r['irr'] is not None else "–")
 
-        start_time = time.time()
-        # Placeholders for live timer and final message     
-        timer_placeholder = st.empty()
-        spinner_placeholder = st.spinner("Vršim financijsku analizu...")      
+        st.subheader(f"{lifetime}-godišnja analiza novčanih tokova")
+        yrs = list(range(0, lifetime + 1))
+        fig = go.Figure()
+        for s in ('month', '15min'):
+            fig.add_trace(go.Bar(x=yrs, y=np.r_[-costs['equity'], res['table'][f'Disk_tok_{s}']],
+                                 name=f'Godišnji diskontirani tok ({LABEL[s]})', marker_color=COLOR[s], opacity=0.55))
+        for s in ('month', '15min'):
+            fig.add_trace(go.Scatter(x=yrs, y=res[s]['cumulative'], name=f'Kumulativno ({LABEL[s]})',
+                                     line=dict(color=COLOR[s], width=3), mode='lines+markers'))
+        fig.add_hline(y=0, line_color='#8a8a84', line_width=1)
+        fig.update_layout(xaxis=dict(title='Godina'), yaxis=dict(title='€'), barmode='group', hovermode='x unified',
+                          legend=dict(orientation='h', x=0.5, xanchor='center', y=1.12), margin=dict(l=10, r=10, t=60, b=10), height=480)
+        show(fig)
+        with st.expander("Tablica novčanih tokova"):
+            st.dataframe(res['table'].round(2))
+            st.download_button("Preuzmi tablicu (CSV)", res['table'].to_csv().encode('utf-8'), "novcani_tokovi.csv", "text/csv")
+        st.caption(f"Izračun trajao {time.time() - t0:.2f} s.")
 
-        st.write("Vrijeme izvođenja analize može varirati ovisno o performansama računala (oko 60 sekundi)")
-        if 'production_data' not in st.session_state or 'prices_df' not in st.session_state:     
-            st.warning("Molim izračunajte proizvodnju SE u kartici Proizvodnja i Godišnji račun...")
-        else:
-            with spinner_placeholder:          
-                    # Get production data from session state
-                    production_data = st.session_state['production_data']
-                    no_pv_df=production_data.copy()
-                    no_pv_df['ac_power_kw']=0
-                    prices_df=st.session_state['prices_df']                    
-                    consumption_df=st.session_state['consumption_data']['consumption_df']
-
-                    def calculate_loan_payment(principal, annual_rate, years):
-                        """Calculate annual loan payment using annuity formula"""
-                        if annual_rate == 0 or years == 0:
-                            return principal / years if years > 0 else principal
-                        
-                        r = annual_rate / 100  # convert % to decimal
-                        n = years
-                        # Annual payment formula
-                        payment = principal * (r * (1 + r)**n) / ((1 + r)**n - 1)
-                        return payment
-                    
-                    # Calculate system cost
-                    system_size_watts = system_capacity_kw * 1000
-                    total_system_cost = system_size_watts * system_cost_per_watt
-                    incentives = total_system_cost * (incentive_percent / 100)
-                    net_system_cost = total_system_cost - incentives
-                    annual_maintenance_cost = total_system_cost * (maintenance_cost_percent / 100)
-
-                    # === Loan calculations ===
-                    loan_amount = net_system_cost * (loan_percent / 100)          # e.g. 70% financed
-                    equity_amount = net_system_cost - loan_amount
-
-                    annual_loan_payment = calculate_loan_payment(
-                    principal=loan_amount,
-                    annual_rate=loan_interest_rate,
-                    years=loan_term_years
-                    )
-
-                    years = list(range(1, system_lifetime_years+1))
-                    yearly_production = []
-                    yearly_maintenance = []
-
-                    yearly_savings_month = [-equity_amount]
-                    yearly_savings_15min = [-equity_amount]
-
-                    discounted_yearly_savings_month= [-equity_amount]
-                    discounted_yearly_savings_15min= [-equity_amount]                    
-                                        
-                    yearly_cumulative_savings_month = [-equity_amount]
-                    yearly_cumulative_savings_15min = [-equity_amount]             
-            
-                    cumulative_savings_month = -equity_amount  # Start with negative investment
-                    cumulative_savings_15min = -equity_amount  # Start with negative investment
-
-                    year_baseline_cost_list = [] 
-
-                    base_prices_df = pd.read_csv(f'{tariff}.csv')
-                    obracun_noPV = energy_calculation(no_pv_df, consumption_df, 3000)               
-                    
-                    for year in years:
-                        #prices_csv=f'{tariff}.csv'
-                        #prices_df=pd.read_csv(prices_csv)
-
-                        prices_df = base_prices_df.copy()
-
-                        # Apply degradation to production
-                        year_degradation_factor = (1 - degradation_rate/100) ** (year - 1)
-                        year_production_data = production_data * year_degradation_factor 
-                        
-                        # Apply electricity price increase
-                        year_rate_factor = (1 + annual_rate_increase/100) ** (year - 1)
-                        ht_lt_cols = [col for col in prices_df.columns if 'HT' in col.upper() or 'LT' in col.upper()]                        
-
-                        # Multiply the selected columns by the factor
-                        prices_df[ht_lt_cols] = prices_df[ht_lt_cols] * year_rate_factor
-                        #prices_df.to_csv('temp_prices.csv', index=False)
-                        #prices_csv_temp='temp_prices.csv'    
-
-                        #obracun_energije_month, racuni_month, bilanca_month, godišnji_month = izvrši_obracun(year_production_data,consumption_df,prices_df,net_interval='month')
-                        #obracun_energije_15min, racuni_15min, bilanca_15min,godišnji_15min = izvrši_obracun(year_production_data,consumption_df,prices_df,net_interval='15min')
-                        #obracun_energije_noPV, racuni_noPV, bilanca_noPV,godišnji_noPV = izvrši_obracun(no_pv_df,consumption_df,prices_df)
-
-                        obracun_PV = energy_calculation(year_production_data, consumption_df, 3000)
-                        bilanca_month, _ = year_total(obracun_PV, create_invoice('month', obracun_PV, prices_df, 3000, 1))
-                        bilanca_15min, _ = year_total(obracun_PV, create_invoice('15min', obracun_PV, prices_df, 3000, 1))
-                        bilanca_noPV, _ = year_total(obracun_noPV, create_invoice('month', obracun_noPV, prices_df, 3000, 1))
-
-                        total_month = bilanca_month.loc['Year', 'Bill']
-                        total_15min = bilanca_15min.loc['Year', 'Bill']
-                        total_noPV = bilanca_noPV.loc['Year', 'Bill']
-
-                        year_baseline_cost_list.append(total_noPV)
-
-                        # Calculate baseline cost with rate increase
-                        year_baseline_cost = total_noPV
-                        # Calculate maintenance with inflation
-                        year_maintenance = annual_maintenance_cost * (1 + inflation_rate/100) ** (year - 1)  # Assume 2% inflation 
-                        # Calculate savings
-                        year_savings_month = year_baseline_cost-year_maintenance-total_month
-                        year_savings_15min = year_baseline_cost-year_maintenance-total_15min
-
-                        if year == 10:
-                            year_savings_month -= inverter_replacement_cost
-                            year_savings_15min -= inverter_replacement_cost
-
-                        # Subtract annual loan payment (only during loan term)
-                        if year <= loan_term_years:
-                            year_savings_month -= annual_loan_payment
-                            year_savings_15min -= annual_loan_payment                        
-
-                        discounted_year_savings_month = year_savings_month / ((1 + discount_rate/100) ** (year-1))
-                        discounted_year_savings_15min = year_savings_15min / ((1 + discount_rate/100) ** (year-1))
-
-                        # Update cumulative savings
-                        cumulative_savings_month += discounted_year_savings_month
-                        cumulative_savings_15min += discounted_year_savings_15min
-                                                                                                                                                                
-                        year_production=year_production_data['ac_power_kw'].sum()
-                        
-                        # Store values
-                        yearly_production.append(year_production)
-                        yearly_maintenance.append(year_maintenance)
-
-                        yearly_savings_15min.append(year_savings_15min)
-                        yearly_savings_month.append(year_savings_month)     
-
-                        discounted_yearly_savings_month.append(discounted_year_savings_month)
-                        discounted_yearly_savings_15min.append(discounted_year_savings_15min)         
-
-                        yearly_cumulative_savings_month.append(cumulative_savings_month)
-                        yearly_cumulative_savings_15min.append(cumulative_savings_15min)
-                                        
-                    for item in yearly_cumulative_savings_month[1:]:
-                        if item >= 0:
-                            discounted_payback_years_month = years[yearly_cumulative_savings_month.index(item)-1]
-                            break
-                        else:
-                            discounted_payback_years_month = system_lifetime_years + 1  # If never pays back within lifetime
-                    for item in yearly_cumulative_savings_15min[1:]:
-                        if item >= 0:
-                            discounted_payback_years_15min = years[yearly_cumulative_savings_15min.index(item)-1]
-                            break
-                        else:
-                            discounted_payback_years_15min = system_lifetime_years + 1  # If never pays back within lifetime      
-
-                    # NPV calculation
-                    npv_month = sum(discounted_yearly_savings_month)
-                    npv_15min =sum(discounted_yearly_savings_15min)
-
-                    # IRR calculation (simplified)
-                    try:
-                        from scipy.optimize import newton
-                        def npv_equation(r):
-                            return sum(cf / (1 + r) ** i for i, cf in enumerate(discounted_yearly_savings_month))
-                        irr = newton(npv_equation, 0.1)  # Use 10% as initial guess
-                    except:
-                        irr = 0  # Default if calculation fails"""
-
-                                        # Display financial metrics
-                    st.subheader("Pregled financijskih pokazatelja")
-                    
-                    # Use single column on mobile, three columns on desktop
-                    if st.session_state.get('_is_mobile', False):
-                        metrics_cols = st.columns(1)
-                        metrics_cols[0].metric("Ukupni troškovi SE", f"€{total_system_cost:,.2f}")
-                        metrics_cols[0].metric("Neto ukupni troškovi sa subvencijom", f"€{net_system_cost:,.2f}")
-                        metrics_cols[0].metric("Početna investicija", f"€{equity_amount:,.2f}")
-
-                        metrics_cols[0].write("Mj.netiranje")
-                        metrics_cols[0].metric("Godišnja ušteda (za 1. godinu)", f"€{yearly_savings_month[1]:,.2f}")
-                        metrics_cols[0].metric("Vrijeme povrata investicije (diskontirano)", f"{discounted_payback_years_month:.0f} g.")
-                        metrics_cols[0].metric("NPV", f"€{npv_month:.1f}")         
-
-                        metrics_cols[0].write("15min netiranje")
-                        metrics_cols[0].metric("Godišnja ušteda (za 1. godinu)", f"€{yearly_savings_15min[1]:,.2f}")
-                        metrics_cols[0].metric("Vrijeme povrata investicije (diskontirano)", f"{discounted_payback_years_15min:.0f} g.")
-                        metrics_cols[0].metric("NPV", f"€{npv_15min:,.2f}")
-
-                        #metrics_cols[0].metric("25-Year ROI", f"{yearly_roi[-1]:.1f}%")
-                        #metrics_cols[0].metric("25-Year Net Profit", f"€{yearly_cumulative_savings[-1]:,.2f}")
-                    else:
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("Ukupni troškovi SE", f"€{total_system_cost:,.2f}")
-                        col1.metric("Neto ukupni troškovi sa subvencijom", f"€{net_system_cost:,.2f}")
-                        col1.metric("Početna investicija", f"€{equity_amount:,.2f}")
-                     
-                        col2.write("Mj.netiranje")
-                        col2.metric("Godišnja ušteda (za 1. godinu)", f"€{yearly_savings_month[1]:,.2f}")
-                        col2.metric("Vrijeme povrata investicije (diskontirano)", f"{discounted_payback_years_month:.0f} g."if discounted_payback_years_month <= 25 else "Ne isplati se u 25g")
-                        col2.metric("NPV", f"€{npv_month:.2f}")                     
-                        
-                        col3.write("15min netiranje")
-                        col3.metric("Godišnja ušteda (za 1. godinu)", f"€{yearly_savings_15min[1]:,.2f}")
-                        col3.metric("Vrijeme povrata investicije (diskontirano)", f"{discounted_payback_years_15min:.0f} g."if discounted_payback_years_15min <= 25 else "Ne isplati se u 25g")
-                        col3.metric("NPV", f"€{npv_15min:,.2f}")
-
-                        #col3.metric("25-Year ROI", f"{yearly_roi[-1]:.1f}%")
-                        #col3.metric("25-Year Net Profit", f"€{yearly_cumulative_savings[-1]:,.2f}")
-
-                    # Create cash flow chart
-                    st.subheader("25-godišnja analiza tokova novca")
-
-                    plot_years = list(range(0, system_lifetime_years+1))
-                    # Create DataFrame for cash flow
-                    cash_flow_df = pd.DataFrame({
-                        'Year': plot_years,
-                        'Annual Savings': discounted_yearly_savings_month,
-                        'Cumulative Savings': yearly_cumulative_savings_month,
-                        'Annual Savings15': discounted_yearly_savings_15min,
-                        'Cumulative Savings15': yearly_cumulative_savings_15min,
-                    })
-                    
-                    # Create dual-axis chart
-                    fig = go.Figure()
-                    
-                    # Add annual savings bars
-                    fig.add_trace(go.Bar(
-                        x=cash_flow_df['Year'],
-                        y=cash_flow_df['Annual Savings'],
-                        name='Godišnja disk. ušteda (Mj.net)',
-                        marker_color='#2ca02c'
-                    ))
-                    fig.add_trace(go.Bar(
-                        x=cash_flow_df['Year'],
-                        y=cash_flow_df['Annual Savings15'],
-                        name='Godišnja disk. ušteda (15min net)',
-                        marker_color="#2c5ea0"
-                    ))
-                    
-                    # Add cumulative savings line
-                    fig.add_trace(go.Scatter(
-                        x=cash_flow_df['Year'],
-                        y=cash_flow_df['Cumulative Savings'],
-                        name='Kumulativna ušteda (Mj.net)',
-                        marker_color='#ff7f0e',
-                        #yaxis='y2'
-                    ))
-
-                    # Add cumulative savings line
-                    fig.add_trace(go.Scatter(
-                        x=cash_flow_df['Year'],
-                        y=cash_flow_df['Cumulative Savings15'],
-                        name='Kumulativna ušteda (15min net)',
-                        marker_color="#ff0e0e",
-                        #yaxis='y2'
-                    ))
-                    
-                    # Update layout for dual y-axes
-                    fig.update_layout(
-                        #title='25-god. analiza tokova novca',
-                        xaxis=dict(title='Godina'),
-                        yaxis=dict(title='God. ušteda (€)', side='left', showgrid=False),
-                        #yaxis2=dict(title='Kumulativna ušteda (€)', side='right', overlaying='y', showgrid=False),
-                        legend=dict(x=0.5, y=0.99, xanchor='center', orientation='h'),
-                        hovermode='x unified'
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    elapsed = time.time() - start_time
-                    timer_placeholder.info(f"⏱️ Proteklo vrijeme: **{elapsed:.1f} sekundi**")                          
-                            
- 
-
+# --------------------------------------------------------------------------- 5 results
 with tabs[5]:
     st.header("Rezultati")
-   
-    col1, col2 = st.columns(1) if st.session_state.get('_is_mobile', False) else st.columns(2)
+    if settlement is None:
+        st.info("Rezultati se prikazuju nakon izračuna godišnjeg računa.")
+    else:
+        pv = production_data['ac_power_kw'].to_numpy()
+        load = consumption_df['consumption_kw'].to_numpy()
+        mon = INDEX_15.month
+        net = pv - load
+        me = pd.DataFrame({'production': pv, 'consumption': load, 'net': net, 'self': np.minimum(pv, load),
+                           'exported': np.clip(net, 0, None), 'imported': np.clip(-net, 0, None)}).groupby(mon).sum()
+        me.index = MONTH_ABBR
+        sell_15 = [settlement['15min'][1][mj].loc[32, 'Cijena EUR/kWh'] for mj in MONTHS]
+        sell_month = settlement['month'][1]['Siječanj'].loc[32, 'Cijena EUR/kWh']
+        buy_vt = float(prices_df.loc[0, 'Total_HT'])
 
-    if st.session_state.get('consumption_data') is not None and st.session_state.get('racuni_15min') is not None:
-        # Group by month
-        monthly_energy = energy_balance.resample('ME').sum()
-        monthly_energy.index = monthly_energy.index.strftime('%b') 
-        price_to_Grid_month=st.session_state['racuni_month']['Siječanj'].loc[32, 'Cijena EUR/kWh']  
-        price_from_Grid_month=st.session_state['prices_df'].loc[0, 'Total_HT']     
-
-        month_names = ['Siječanj', 'Veljača', 'Ožujak', 'Travanj', 'Svibanj', 'Lipanj',
-                        'Srpanj', 'Kolovoz', 'Rujan', 'Listopad', 'Studeni', 'Prosinac']
-        prices_to_Grid = [st.session_state['racuni_15min'][month].loc[32, 'Cijena EUR/kWh'] for month in month_names]  
-
-        monthly_energy['price_to_Grid_15min'] = prices_to_Grid
-        
-
-        st.subheader("Cijene energije u višoj tarifi (VT) kod mjesečnog i 15minutnog netiranja")  
-        fig = go.Figure()      
-   
-        # Add consumption line
-        fig.add_trace(go.Scatter(
-            x=monthly_energy.index,
-            y=monthly_energy['price_to_Grid_15min'],
-            name='Cijena isporučene energije (15min netiranje)',
-            marker_color="#260eff",
-            mode='lines+markers'
-        ))
-
-        fig.add_trace(go.Scatter(
-            x=monthly_energy.index,
-            y=[price_to_Grid_month]*len(monthly_energy.index),
-            name='Cijena isporučene energije (Mj.netiranje)',
-            marker_color="#09f11c",
-            mode='lines+markers'
-        ))
-        fig.add_trace(go.Scatter(
-            x=monthly_energy.index,
-            y=[price_from_Grid_month]*len(monthly_energy.index),
-            name='Cijena preuzete energije ',
-            marker_color="#f70808",
-            mode='lines+markers'
-        ))
-
-      
-        fig.update_layout(        
-            xaxis=dict(title='Mjesec'),
-            yaxis=dict(title='EUR/kWh'),
-            barmode='stack',
-            legend=dict(x=0.01, y=0.99),
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.write("Cijene isporučene energije u mrežu su značajno niže od cijena preuzete energije, a kod 15minutnog netiranja variraju te su niže u mjesecima sa velikim viškovima energije.")
-        
-        st.subheader("Mjesečni pregled bilance energije kod mjesečnog netiranja")
-        st.write(f"Samo mjesečni viškovi proizvedene energije se obračunavaju po cijeni energije isporučene u mrežu ({price_to_Grid_month:.3f}EUR/kWh u VT), koja je značajno niža od cijene preuzete energije ({price_from_Grid_month:.3f}EUR/kWh u VT).")
-        st.write("U slučaju da je više energije potrošeno nego proizvedeno unutar mjeseca, čitava proizvedena energija je samopotrošena, tj.ne obračunava se energija isporučena u mrežu.")
-               
-        # Create stacked bar chart
+        st.subheader("Cijena preuzete i predane energije u višoj tarifi (VT), 1. godina")
         fig = go.Figure()
-        
-        fig.add_trace(go.Bar(
-            x=monthly_energy.index,
-            y=monthly_energy['production_kw'],
-            name='Proizvodnja',
-            marker_color='#2ca02c',
-            opacity=1.0
-        ))
+        fig.add_trace(go.Scatter(x=MONTH_ABBR, y=[buy_vt] * 12, name='Preuzeta energija (VT, s naknadama i PDV-om)',
+                                 line=dict(color='#d62728'), mode='lines+markers'))
+        fig.add_trace(go.Scatter(x=MONTH_ABBR, y=[sell_month] * 12, name=f'Višak – {LABEL["month"]} (0,8 · Cp)',
+                                 line=dict(color=COLOR['month']), mode='lines+markers'))
+        fig.add_trace(go.Scatter(x=MONTH_ABBR, y=sell_15, name=f'Predana energija – {LABEL["15min"]}',
+                                 line=dict(color=COLOR['15min']), mode='lines+markers'))
+        fig.update_layout(yaxis=dict(title='EUR/kWh', rangemode='tozero'), hovermode='x unified',
+                          legend=dict(x=0.01, y=0.99), margin=dict(l=10, r=10, t=10, b=10), height=420)
+        show(fig)
+        st.write("Kod neto obračuna vrijednost predane energije pada u mjesecima u kojima kućanstvo preda više energije nego što preuzme (omjer Ep/Ei < 1).")
 
-        fig.add_trace(go.Bar(
-            x=monthly_energy.index,
-            y=-np.maximum(0, monthly_energy['net_kw']),
-            name='Neto višak ',
-            marker=dict(
-                color='#1f77b4',  
-                pattern_shape='/' ,                 # diagonal hatch (most visible)
-                # Other good options: 'x', '\\', '|', '-', '+', '.'
-                pattern_fillmode='overlay',         # important: draws pattern on top of color
-                pattern_fgcolor='#2ca02c',  
-                pattern_fgopacity=1,
-                pattern_size=24,                     # density of the hatching
-                line=dict(color='rgba(214, 39, 40, 0.6)', width=0.5)  # optional thin border
-            )
-        ))
-
-        fig.add_trace(go.Bar(
-            x=monthly_energy.index,
-            y=-np.minimum(0, monthly_energy['net_kw']),
-            name='Neto manjak ',
-            marker_color='#d62728'
-            )) 
-        
-        # Add consumption line
-        fig.add_trace(go.Scatter(
-            x=monthly_energy.index,
-            y=monthly_energy['consumption_kw'],
-            name='Potrošnja',
-            marker_color='#ff7f0e',
-            mode='lines+markers'
-        ))
-        
-        fig.update_layout(
-            title='Mjesečna bilanca energije',
-            xaxis=dict(title='Mjesec'),
-            yaxis=dict(title='Energija (kWh)'),
-            barmode='stack',
-            legend=dict(x=0.01, y=0.99),
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Create monthly breakdown chart
-        st.subheader("Mjesečni pregled bilance energije kod 15minutnog netiranja")
-        st.write("Svi viškovi proizvedene energije unutar 15-minutnog perioda se obračunavaju po cijeni energije isporučene (plavo) u mrežu, koja je značajno niža od cijene preuzete energije (crveno).")
-    
-        # Create stacked bar chart
+        st.subheader(f"Mjesečna bilanca – {LABEL['month']}")
+        st.write(f"Netiraju se mjesečne količine po tarifama; samo mjesečni višak u tarifi plaća se po {sell_month:.3f} EUR/kWh (VT), "
+                 f"a ušteđeni kWh vrijedi punu cijenu preuzete energije ({buy_vt:.3f} EUR/kWh u VT).")
         fig = go.Figure()
-        
-        fig.add_trace(go.Bar(
-            x=monthly_energy.index,
-            y=monthly_energy['self_consumed_kw'],
-            name='Samopotrošnja',
-            marker_color='#2ca02c'
-        ))
+        fig.add_trace(go.Bar(x=me.index, y=me['production'], name='Proizvodnja', marker_color=COLOR['month']))
+        fig.add_trace(go.Bar(x=me.index, y=-np.maximum(0, me['net']), name='Neto višak', marker_color=COLOR['15min'],
+                             marker_pattern_shape='/'))
+        fig.add_trace(go.Bar(x=me.index, y=-np.minimum(0, me['net']), name='Neto manjak', marker_color='#d62728'))
+        fig.add_trace(go.Scatter(x=me.index, y=me['consumption'], name='Potrošnja', line=dict(color='#ff7f0e'), mode='lines+markers'))
+        fig.update_layout(yaxis=dict(title='Energija (kWh)'), barmode='relative', hovermode='x unified',
+                          legend=dict(x=0.01, y=0.99), margin=dict(l=10, r=10, t=10, b=10), height=420)
+        show(fig)
 
-        fig.add_trace(go.Bar(
-            x=monthly_energy.index,
-            y=monthly_energy['imported_kw'],
-            name='Preuzeto iz mreže',
-            marker_color='#d62728'
-        ))
-        fig.add_trace(go.Bar(
-            x=monthly_energy.index,
-            y=monthly_energy['exported_kw'],
-            name='Isporučeno u mrežu',
-            marker_color='#1f77b4'
-        ))
-        
-        # Add consumption line
-        fig.add_trace(go.Scatter(
-            x=monthly_energy.index,
-            y=monthly_energy['consumption_kw'],
-            name='Potrošnja',
-            marker_color='#ff7f0e',
-            mode='lines+markers'
-        ))
-        
-        fig.update_layout(
-            title='Mjesečna bilanca energije',
-            xaxis=dict(title='Mjesec'),
-            yaxis=dict(title='Energija (kWh)'),
-            barmode='stack',
-            legend=dict(x=0.01, y=0.99),
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)              
-        
-                
-        
-
+        st.subheader(f"Mjesečna bilanca – {LABEL['15min']}")
+        st.write("Sva energija preuzeta iz mreže plaća se po punoj cijeni, a sva predana energija vrednuje se po nižoj cijeni predane energije.")
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=me.index, y=me['self'], name='Vlastita potrošnja proizvodnje', marker_color=COLOR['month']))
+        fig.add_trace(go.Bar(x=me.index, y=me['imported'], name='Preuzeto iz mreže', marker_color='#d62728'))
+        fig.add_trace(go.Bar(x=me.index, y=me['exported'], name='Predano u mrežu', marker_color=COLOR['15min']))
+        fig.add_trace(go.Scatter(x=me.index, y=me['consumption'], name='Potrošnja', line=dict(color='#ff7f0e'), mode='lines+markers'))
+        fig.update_layout(yaxis=dict(title='Energija (kWh)'), barmode='stack', hovermode='x unified',
+                          legend=dict(x=0.01, y=0.99), margin=dict(l=10, r=10, t=10, b=10), height=420)
+        show(fig)
