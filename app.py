@@ -26,7 +26,7 @@ st.set_page_config(page_title="Kalkulator isplativosti SE", page_icon="☀️",
                    layout="wide", initial_sidebar_state="expanded")
 
 # All series use one fixed, non-leap calendar in CET (UTC+1, no DST), 15-minute resolution.
-REF_YEAR = 2019
+REF_YEAR = 2023
 N15 = 35040
 INDEX_15 = pd.date_range(f"{REF_YEAR}-01-01", periods=N15, freq="15min")
 MONTHS = eb.MJESECI
